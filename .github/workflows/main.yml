@@ -54,6 +54,9 @@ jobs:
     needs: build
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
       - name: Set version
         run: |
           VERSION=$(TZ=Asia/Shanghai date +'%Y%m%d')
