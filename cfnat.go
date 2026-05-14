@@ -49,7 +49,9 @@ func NewIPManager() *IPManager {
 func (m *IPManager) SetIPAddresses(ips []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ipAddresses = ips
+
+	m.ipAddresses = append([]string(nil), ips...)
+	m.currentIP = ""
 	m.currentIndex = 0
 	m.allIPsChecked = false
 }
@@ -66,10 +68,62 @@ func (m *IPManager) SetCurrentIP(ip string) {
 	m.currentIP = ip
 }
 
+func (m *IPManager) SetCurrentIPWithIndex(ip string, index int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.currentIP = ip
+	m.currentIndex = index
+	m.allIPsChecked = false
+}
+
 func (m *IPManager) GetIPAddresses() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.ipAddresses
+
+	ips := make([]string, len(m.ipAddresses))
+	copy(ips, m.ipAddresses)
+	return ips
+}
+
+// GetTargetIPs 返回用于当前连接尝试的候选 IP。
+// 第一个永远是 currentIP，后面按扫描结果顺序补足，避免重复连接同一个 IP。
+func (m *IPManager) GetTargetIPs(num int) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if num <= 0 {
+		num = 1
+	}
+
+	targets := make([]string, 0, num)
+	seen := make(map[string]struct{}, num)
+
+	if m.currentIP != "" {
+		targets = append(targets, m.currentIP)
+		seen[m.currentIP] = struct{}{}
+	}
+
+	for i := m.currentIndex + 1; i < len(m.ipAddresses) && len(targets) < num; i++ {
+		ip := m.ipAddresses[i]
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		targets = append(targets, ip)
+		seen[ip] = struct{}{}
+	}
+
+	// 如果 currentIndex 后面的 IP 不够，则从前面补齐，仍然避免重复。
+	for i := 0; i <= m.currentIndex && i < len(m.ipAddresses) && len(targets) < num; i++ {
+		ip := m.ipAddresses[i]
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		targets = append(targets, ip)
+		seen[ip] = struct{}{}
+	}
+
+	return targets
 }
 
 func (m *IPManager) IsAllIPsChecked() bool {
@@ -88,28 +142,35 @@ func (m *IPManager) Clear() {
 }
 
 func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, code int) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// 不要持有写锁进行网络请求，否则会阻塞 GetCurrentIP / GetTargetIPs。
+	m.mu.RLock()
+	ips := append([]string(nil), m.ipAddresses...)
+	startIndex := m.currentIndex + 1
+	currentIP := m.currentIP
+	m.mu.RUnlock()
 
-	// 尝试从当前索引的下一个 IP 开始检查
-	for i := m.currentIndex + 1; i < len(m.ipAddresses); i++ {
-		ip := m.ipAddresses[i]
-
-		// 跳过当前 IP
-		if ip == m.currentIP {
+	for i := startIndex; i < len(ips); i++ {
+		ip := ips[i]
+		if ip == currentIP {
 			continue
 		}
 
 		if checkValidIP(ip, port, useTLS, domain, code) {
+			m.mu.Lock()
 			m.currentIP = ip
 			m.currentIndex = i
 			m.allIPsChecked = false
-			log.Printf("切换到新的有效 IP: %s 更新 IP 索引: %d", m.currentIP, m.currentIndex)
+			m.mu.Unlock()
+
+			log.Printf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, i)
 			return true
 		}
 	}
 
+	m.mu.Lock()
 	m.allIPsChecked = true
+	m.mu.Unlock()
+
 	log.Println("所有 IP 都已检查过，程序将退出")
 	return false
 }
@@ -140,7 +201,7 @@ func main() {
 	domain := flag.String("domain", "cloudflaremirrors.com/debian", "响应状态码检查的域名地址")
 	ipCount := flag.Int("ipnum", 20, "提取的有效IP数量")
 	ipsType := flag.String("ips", "4", "指定生成IPv4还是IPv6地址 (4或6)")
-	num := flag.Int("num", 5, "目标负载 IP 数量")
+	num := flag.Int("num", 5, "每个客户端连接并发尝试的候选目标 IP 数量")
 	port := flag.Int("port", 443, "转发的目标端口")
 	random := flag.Bool("random", true, "是否随机生成IP，如果为false，则从CIDR中拆分出所有IP")
 	maxThreads := flag.Int("task", 100, "并发请求最大协程数")
@@ -148,22 +209,19 @@ func main() {
 
 	flag.Parse()
 
-	// 创建 IP 管理器
 	ipManager := NewIPManager()
 
-	// 启动 TCP 监听
 	listener, err := net.Listen("tcp", *localAddr)
 	if err != nil {
 		log.Fatalf("无法监听 %s: %v", *localAddr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("正在监听 %s 并转发到 %d 个目标地址，有效延迟：%d ms", *localAddr, *num, *Delay)
+	log.Printf("正在监听 %s，每个客户端最多并发尝试 %d 个候选目标 IP，有效延迟：%d ms", *localAddr, *num, *Delay)
 
 	for {
 		startTime := time.Now()
 
-		// 使用函数处理 locations.json，确保 defer 正确执行
 		locations, err := loadLocations()
 		if err != nil {
 			log.Printf("加载位置信息失败: %v", err)
@@ -179,7 +237,6 @@ func main() {
 		var url string
 		var filename string
 
-		// 使用 switch 替代 if-else
 		switch *ipsType {
 		case "6":
 			filename = "ips-v6.txt"
@@ -194,7 +251,6 @@ func main() {
 
 		var content string
 
-		// 检查本地是否有文件
 		if _, err = os.Stat(filename); os.IsNotExist(err) {
 			fmt.Printf("文件 %s 不存在，正在从 URL %s 下载数据\n", filename, url)
 			content, err = getURLContent(url)
@@ -232,7 +288,6 @@ func main() {
 			}
 		}
 
-		// 从生成的 IP 列表进行处理
 		results := scanIPs(ipList, locationMap, *maxThreads)
 
 		if len(results) == 0 {
@@ -241,13 +296,12 @@ func main() {
 			continue
 		}
 
-		// 应用数据中心筛选
 		if *coloFilter != "" {
 			filters := strings.Split(*coloFilter, ",")
 			var filteredResults []result
 			for _, r := range results {
 				for _, filter := range filters {
-					if strings.EqualFold(r.dataCenter, filter) {
+					if strings.EqualFold(r.dataCenter, strings.TrimSpace(filter)) {
 						filteredResults = append(filteredResults, r)
 						break
 					}
@@ -256,12 +310,10 @@ func main() {
 			results = filteredResults
 		}
 
-		// 按 TCP 延迟排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].tcpDuration < results[j].tcpDuration
 		})
 
-		// 只显示指定数量的 IP
 		if len(results) > *ipCount {
 			results = results[:*ipCount]
 		}
@@ -273,37 +325,30 @@ func main() {
 
 		fmt.Printf("成功提取 %d 个有效IP，耗时 %d秒\n", len(results), time.Since(startTime)/time.Second)
 
-		// 设置 IP 地址列表
 		var ips []string
 		for _, r := range results {
 			ips = append(ips, r.ip)
 		}
 		ipManager.SetIPAddresses(ips)
 
-		// 选择一个有效 IP
-		currentIP := selectValidIP(ipManager, *useTLS, *port, *domain, *code)
+		currentIP, currentIndex := selectValidIP(ipManager, *useTLS, *port, *domain, *code)
 		if currentIP == "" {
 			log.Printf("没有有效的 IP 可用")
 			continue
 		}
-		ipManager.SetCurrentIP(currentIP)
+		ipManager.SetCurrentIPWithIndex(currentIP, currentIndex)
 
-		// 创建用于控制 goroutine 退出的 context
 		ctx, cancel := context.WithCancel(context.Background())
-
-		// 用于状态检查完成的信号
 		done := make(chan bool)
 
 		var loopWG sync.WaitGroup
 		loopWG.Add(2)
 
-		// 启动状态检查线程
 		go func() {
 			defer loopWG.Done()
-			statusCheck(ctx, *localAddr, *useTLS, *port, done, *domain, *code, time.Duration(*Delay)*time.Millisecond, ipManager)
+			statusCheck(ctx, *useTLS, *port, done, *domain, *code, time.Duration(*Delay)*time.Millisecond, ipManager)
 		}()
 
-		// 主循环，接收连接
 		go func() {
 			defer loopWG.Done()
 			for {
@@ -312,7 +357,6 @@ func main() {
 					log.Println("连接接受 goroutine 收到退出信号")
 					return
 				default:
-					// 设置接受连接的超时，以便能够检查 context
 					if tcpListener, ok := listener.(*net.TCPListener); ok {
 						tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
 					}
@@ -332,17 +376,23 @@ func main() {
 					atomic.AddInt32(&activeConnections, 1)
 					log.Printf("客户端来源: %s 连接建立，当前活跃连接数: %d", clientAddr, atomic.LoadInt32(&activeConnections))
 
-					currIP := ipManager.GetCurrentIP()
-					go handleConnection(conn, generateTargets(currIP, *port, *num), time.Duration(*Delay)*time.Millisecond)
+					targetIPs := ipManager.GetTargetIPs(*num)
+					if len(targetIPs) == 0 {
+						log.Println("当前没有可用候选目标 IP，关闭客户端连接")
+						conn.Close()
+						atomic.AddInt32(&activeConnections, -1)
+						continue
+					}
+
+					go handleConnection(conn, generateTargets(targetIPs, *port), time.Duration(*Delay)*time.Millisecond)
 				}
 			}
 		}()
 
 		<-done
-		cancel() // 取消 context，通知所有 goroutine 退出
+		cancel()
 		loopWG.Wait()
 
-		// 清空 IP 地址
 		ipManager.Clear()
 		validIPClientCache = sync.Map{}
 		log.Println("主函数将退出当前循环，因为所有 IP 都已用尽")
@@ -441,7 +491,6 @@ func scanIPs(ipList []string, locationMap map[string]location, maxThreads int) [
 
 			tcpDuration := time.Since(start)
 
-			// 通过根路径响应头里的 CF-RAY 提取机房信息
 			requestURL := "http://" + net.JoinHostPort(ipAddr, "80")
 			req, err := http.NewRequest("GET", requestURL, nil)
 			if err != nil {
@@ -559,7 +608,6 @@ func nextRandomIntn(n int) int {
 func getRandomIPv4s(ipList []string) []string {
 	var randomIPs []string
 	for _, subnet := range ipList {
-		// 跳过空行
 		subnet = strings.TrimSpace(subnet)
 		if subnet == "" {
 			continue
@@ -573,6 +621,31 @@ func getRandomIPv4s(ipList []string) []string {
 		}
 	}
 	return randomIPs
+}
+
+// 根据父 CIDR 生成其中第 index 个 targetBits 子网
+func makeSubPrefix(parent netip.Prefix, targetBits int, index uint64) netip.Prefix {
+	parent = parent.Masked()
+
+	ipBytes := parent.Addr().As16()
+	parentBits := parent.Bits()
+	diff := targetBits - parentBits
+
+	for i := 0; i < diff; i++ {
+		bitValue := (index >> uint(diff-1-i)) & 1
+
+		bitPos := parentBits + i
+		byteIndex := bitPos / 8
+		bitIndex := 7 - (bitPos % 8)
+
+		if bitValue == 1 {
+			ipBytes[byteIndex] |= byte(1 << bitIndex)
+		} else {
+			ipBytes[byteIndex] &^= byte(1 << bitIndex)
+		}
+	}
+
+	return netip.PrefixFrom(netip.AddrFrom16(ipBytes), targetBits).Masked()
 }
 
 // 在指定 IPv6 CIDR 内随机生成一个 IPv6
@@ -609,31 +682,6 @@ func randomIPv6InPrefix(prefix netip.Prefix) string {
 	return netip.AddrFrom16(ipBytes).String()
 }
 
-// 根据父 CIDR 生成其中第 index 个 targetBits 子网
-func makeSubPrefix(parent netip.Prefix, targetBits int, index uint64) netip.Prefix {
-	parent = parent.Masked()
-
-	ipBytes := parent.Addr().As16()
-	parentBits := parent.Bits()
-	diff := targetBits - parentBits
-
-	for i := 0; i < diff; i++ {
-		bitValue := (index >> uint(diff-1-i)) & 1
-
-		bitPos := parentBits + i
-		byteIndex := bitPos / 8
-		bitIndex := 7 - (bitPos % 8)
-
-		if bitValue == 1 {
-			ipBytes[byteIndex] |= byte(1 << bitIndex)
-		} else {
-			ipBytes[byteIndex] &^= byte(1 << bitIndex)
-		}
-	}
-
-	return netip.PrefixFrom(netip.AddrFrom16(ipBytes), targetBits).Masked()
-}
-
 // 如果掩码 < 52，则从每个 /52 中随机提取一个 IPv6
 // 如果掩码 >= 52，则从当前 CIDR 中随机提取一个 IPv6
 func getRandomIPv6s(ipList []string) []string {
@@ -658,8 +706,6 @@ func getRandomIPv6s(ipList []string) []string {
 		bits := prefix.Bits()
 
 		if bits < 52 {
-			// 例如 /48 到 /52：
-			// 2^(52-48) = 16 个 /52
 			count := uint64(1) << uint(52-bits)
 
 			for i := uint64(0); i < count; i++ {
@@ -686,7 +732,6 @@ func readIPs(filename string) ([]string, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// 跳过空行
 		if line == "" {
 			continue
 		}
@@ -695,7 +740,6 @@ func readIPs(filename string) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			// 使用新变量避免遮蔽
 			for currentIP := ipAddr.Mask(ipNet.Mask); ipNet.Contains(currentIP); incrementIP(currentIP) {
 				ips = append(ips, currentIP.String())
 			}
@@ -721,15 +765,22 @@ func incrementIP(ip net.IP) {
 	}
 }
 
-func generateTargets(ip string, port int, num int) []string {
-	targets := make([]string, num)
-	address := ip
-	if strings.Contains(ip, ":") {
-		address = fmt.Sprintf("[%s]", ip)
+func generateTargets(ips []string, port int) []string {
+	targets := make([]string, 0, len(ips))
+	seen := make(map[string]struct{}, len(ips))
+
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		targets = append(targets, net.JoinHostPort(ip, fmt.Sprintf("%d", port)))
 	}
-	for i := 0; i < num; i++ {
-		targets[i] = fmt.Sprintf("%s:%d", address, port)
-	}
+
 	return targets
 }
 
@@ -785,98 +836,53 @@ func checkValidIP(ip string, port int, useTLS bool, domain string, code int) boo
 	return isValid
 }
 
-func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, code int) string {
-	for _, ip := range ipManager.GetIPAddresses() {
+func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, code int) (string, int) {
+	ips := ipManager.GetIPAddresses()
+	for i, ip := range ips {
 		if checkValidIP(ip, port, useTLS, domain, code) {
-			return ip
+			return ip, i
 		}
 	}
-	return ""
+	return "", -1
 }
 
-func statusCheck(ctx context.Context, localAddr string, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager) {
-	_, localPort, _ := net.SplitHostPort(localAddr)
-	checkAddr := fmt.Sprintf("127.0.0.1:%s", localPort)
+func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager) {
+	interval := 2 * time.Second
+	if delay > interval {
+		interval = delay
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	failCount := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("状态检查收到退出信号")
 			return
-		default:
-		}
-
-		failCount := 0
-		log.Printf("开始状态检查，目标地址: %s", checkAddr)
-
-		for failCount < 2 {
-			select {
-			case <-ctx.Done():
-				log.Println("状态检查收到退出信号")
-				return
-			default:
-			}
-
-			conn, err := net.DialTimeout("tcp", checkAddr, delay)
-			if err != nil {
+		case <-ticker.C:
+			currentIP := ipManager.GetCurrentIP()
+			if currentIP == "" {
 				failCount++
-				log.Printf("状态检查失败 (%d/2): 无法连接到 %s 错误: %v", failCount, checkAddr, err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			// 使用带超时的读取检查
-			checkSuccess := make(chan bool, 1)
-			go func() {
-				reader := bufio.NewReader(conn)
-				conn.SetReadDeadline(time.Now().Add(delay + 1*time.Second))
-				_, err := reader.ReadString('\n')
-				if err != nil {
-					if err == io.EOF {
-						checkSuccess <- false
-					} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						// 超时说明连接保持正常
-						checkSuccess <- true
-					} else {
-						checkSuccess <- false
-					}
-				} else {
-					checkSuccess <- true
-				}
-			}()
-
-			select {
-			case success := <-checkSuccess:
-				if success {
-					log.Printf("状态检查成功: 连接到 %s 成功", checkAddr)
-					failCount = 0
-				} else {
-					failCount++
-					log.Printf("状态检查失败 (%d/2): 服务端断开连接", failCount)
-				}
-			case <-time.After(delay + 2*time.Second):
-				log.Printf("状态检查成功: 连接到 %s 保持稳定", checkAddr)
+				log.Printf("状态检查失败 (%d/2): 当前没有可用 IP", failCount)
+			} else if checkValidIP(currentIP, port, useTLS, domain, code) {
 				failCount = 0
-			case <-ctx.Done():
-				conn.Close()
-				log.Println("状态检查收到退出信号")
-				return
+				log.Printf("状态检查成功，当前 IP 正常: %s", currentIP)
+			} else {
+				failCount++
+				log.Printf("状态检查失败 (%d/2)，当前 IP: %s", failCount, currentIP)
 			}
 
-			conn.Close()
-
-			if failCount == 0 {
-				time.Sleep(2 * time.Second)
-				break
-			}
-		}
-
-		if failCount >= 2 {
-			log.Println("连续两次状态检查失败，切换到下一个 IP")
-			if !ipManager.switchToNextValidIP(useTLS, port, domain, code) {
-				log.Println("所有 IP 都已检查过，状态检查停止")
-				done <- true
-				return
+			if failCount >= 2 {
+				log.Println("连续两次状态检查失败，切换到下一个 IP")
+				if !ipManager.switchToNextValidIP(useTLS, port, domain, code) {
+					log.Println("所有 IP 都已检查过，状态检查停止")
+					done <- true
+					return
+				}
+				failCount = 0
 			}
 		}
 	}
@@ -891,6 +897,11 @@ func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration)
 		conn.Close()
 	}()
 
+	if len(forwardAddrs) == 0 {
+		log.Println("未提供转发地址，关闭客户端连接")
+		return
+	}
+
 	type connResult struct {
 		conn   net.Conn
 		addr   string
@@ -900,7 +911,6 @@ func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration)
 
 	results := make(chan connResult, len(forwardAddrs))
 
-	// 并发尝试连接每个转发地址
 	for _, addr := range forwardAddrs {
 		go func(targetAddr string) {
 			start := time.Now()
@@ -921,7 +931,6 @@ func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration)
 	var bestDelay time.Duration
 	var bestAddr string
 
-	// 收集结果并找到延迟最低的有效连接
 	for i := 0; i < len(forwardAddrs); i++ {
 		res := <-results
 		if res.conn != nil {
@@ -947,7 +956,6 @@ func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration)
 		log.Printf("地址: %s 延迟: %d ms", vc.addr, vc.delay.Milliseconds())
 	}
 
-	// 如果找到最佳连接，开始转发数据
 	if bestConn != nil {
 		log.Printf("选择最佳连接: 地址: %s 延迟: %d ms", bestAddr, bestDelay.Milliseconds())
 		pipeConnections(conn, bestConn)
