@@ -1006,7 +1006,6 @@ func checkValidIP(ip string, port int, useTLS bool, domain string, code int) boo
 		transport := &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				log.Printf("尝试连接 IP: %s 端口: %d", ip, port)
 				dialer := &net.Dialer{Timeout: 2 * time.Second}
 				return dialer.DialContext(ctx, network, fmt.Sprintf("%s:%d", address, port))
 			},
@@ -1019,24 +1018,19 @@ func checkValidIP(ip string, port int, useTLS bool, domain string, code int) boo
 		client = actual.(*http.Client)
 	}
 
-	log.Printf("向 URL %s 发送请求以检查 IP %s 是否有效", targetURL, ip)
 	resp, err := client.Get(targetURL)
 	if err != nil {
-		log.Printf("检查 IP %s 时发生错误: %v", ip, err)
+		log.Printf("检查 IP 失败: %s -> %s，错误: %v", ip, targetURL, err)
 		return false
 	}
 	defer resp.Body.Close()
 
-	log.Printf("IP %s 的检查响应状态码: %d", ip, resp.StatusCode)
-
-	isValid := resp.StatusCode == code
-	if isValid {
-		log.Printf("IP %s 是有效的", ip)
-	} else {
-		log.Printf("IP %s 不是有效的", ip)
+	if resp.StatusCode != code {
+		log.Printf("检查 IP 失败: %s -> %s，状态码: %d，期望: %d", ip, targetURL, resp.StatusCode, code)
+		return false
 	}
 
-	return isValid
+	return true
 }
 
 func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, code int) (string, int) {
@@ -1059,6 +1053,8 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 	defer ticker.Stop()
 
 	failCount := 0
+	wasUnhealthy := false
+	lastLoggedIP := ""
 
 	for {
 		select {
@@ -1069,17 +1065,27 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 			currentIP := ipManager.GetCurrentIP()
 			if currentIP == "" {
 				failCount++
-				log.Printf("状态检查失败 (%d/2): 当前没有可用 IP", failCount)
+				wasUnhealthy = true
+				if failCount == 1 {
+					log.Println("状态检查异常: 当前没有可用 IP")
+				}
 			} else if checkValidIP(currentIP, port, useTLS, domain, code) {
+				if wasUnhealthy || failCount > 0 || currentIP != lastLoggedIP {
+					log.Printf("状态检查正常: 当前 IP %s", currentIP)
+				}
 				failCount = 0
-				log.Printf("状态检查成功，当前 IP 正常: %s", currentIP)
+				wasUnhealthy = false
+				lastLoggedIP = currentIP
 			} else {
 				failCount++
+				wasUnhealthy = true
 				log.Printf("状态检查失败 (%d/2)，当前 IP: %s", failCount, currentIP)
 			}
 
 			if failCount >= 2 {
-				log.Println("连续两次状态检查失败，切换到下一个 IP")
+				oldIP := currentIP
+				log.Printf("连续两次状态检查失败，准备切换 IP，当前 IP: %s", oldIP)
+
 				if !ipManager.switchToNextValidIP(useTLS, port, domain, code) {
 					log.Println("所有 IP 都已检查过，状态检查停止")
 					done <- true
@@ -1087,11 +1093,15 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 				}
 
 				newIP := ipManager.GetCurrentIP()
+				log.Printf("状态检查已切换 IP: %s -> %s", oldIP, newIP)
+
 				if err := cfUpdater.UpdateIfChanged(newIP); err != nil {
 					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
 				}
 
 				failCount = 0
+				wasUnhealthy = false
+				lastLoggedIP = newIP
 			}
 		}
 	}
