@@ -575,6 +575,65 @@ func getRandomIPv4s(ipList []string) []string {
 	return randomIPs
 }
 
+// 在指定 IPv6 CIDR 内随机生成一个 IPv6
+func randomIPv6InPrefix(prefix netip.Prefix) string {
+	prefix = prefix.Masked()
+
+	ipBytes := prefix.Addr().As16()
+	bits := prefix.Bits()
+
+	fullBytes := bits / 8
+	remainBits := bits % 8
+
+	if fullBytes >= 16 {
+		return prefix.Addr().String()
+	}
+
+	start := fullBytes
+
+	if remainBits != 0 {
+		keepMask := byte(0xff << uint(8-remainBits))
+		randomMask := ^keepMask
+
+		randomPart := byte(nextRandomIntn(1 << uint(8-remainBits)))
+
+		ipBytes[fullBytes] = (ipBytes[fullBytes] & keepMask) | (randomPart & randomMask)
+
+		start = fullBytes + 1
+	}
+
+	for i := start; i < 16; i++ {
+		ipBytes[i] = byte(nextRandomIntn(256))
+	}
+
+	return netip.AddrFrom16(ipBytes).String()
+}
+
+// 根据父 CIDR 生成其中第 index 个 targetBits 子网
+func makeSubPrefix(parent netip.Prefix, targetBits int, index uint64) netip.Prefix {
+	parent = parent.Masked()
+
+	ipBytes := parent.Addr().As16()
+	parentBits := parent.Bits()
+	diff := targetBits - parentBits
+
+	for i := 0; i < diff; i++ {
+		bitValue := (index >> uint(diff-1-i)) & 1
+
+		bitPos := parentBits + i
+		byteIndex := bitPos / 8
+		bitIndex := 7 - (bitPos % 8)
+
+		if bitValue == 1 {
+			ipBytes[byteIndex] |= byte(1 << bitIndex)
+		} else {
+			ipBytes[byteIndex] &^= byte(1 << bitIndex)
+		}
+	}
+
+	return netip.PrefixFrom(netip.AddrFrom16(ipBytes), targetBits).Masked()
+}
+
 // 如果掩码 < 52，则从每个 /52 中随机提取一个 IPv6
 // 如果掩码 >= 52，则从当前 CIDR 中随机提取一个 IPv6
 func getRandomIPv6s(ipList []string) []string {
