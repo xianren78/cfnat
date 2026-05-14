@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -193,6 +195,190 @@ type location struct {
 	City   string  `json:"city"`
 }
 
+type CloudflareDNSUpdater struct {
+	enabled    bool
+	token      string
+	zoneID     string
+	recordID   string
+	recordName string
+	proxied    bool
+	ttl        int
+	client     *http.Client
+	mu         sync.Mutex
+	lastIP     string
+}
+
+type cloudflareDNSRecord struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+type cloudflareDNSRecordResponse struct {
+	Success bool                 `json:"success"`
+	Errors  []cloudflareAPIError `json:"errors"`
+	Result  cloudflareDNSRecord  `json:"result"`
+}
+
+type cloudflareDNSRecordListResponse struct {
+	Success bool                  `json:"success"`
+	Errors  []cloudflareAPIError  `json:"errors"`
+	Result  []cloudflareDNSRecord `json:"result"`
+}
+
+type cloudflareAPIError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func NewCloudflareDNSUpdater(enabled bool, token, zoneID, recordID, recordName string, proxied bool, ttl int) *CloudflareDNSUpdater {
+	return &CloudflareDNSUpdater{
+		enabled:    enabled,
+		token:      strings.TrimSpace(token),
+		zoneID:     strings.TrimSpace(zoneID),
+		recordID:   strings.TrimSpace(recordID),
+		recordName: strings.TrimSpace(recordName),
+		proxied:    proxied,
+		ttl:        ttl,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
+}
+
+func (u *CloudflareDNSUpdater) Enabled() bool {
+	return u != nil && u.enabled && u.token != "" && u.zoneID != "" && u.recordName != ""
+}
+
+func (u *CloudflareDNSUpdater) UpdateIfChanged(ip string) error {
+	if !u.Enabled() {
+		return nil
+	}
+
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return fmt.Errorf("Cloudflare AAAA 更新失败：无效 IP %q: %w", ip, err)
+	}
+	if !addr.Is6() {
+		return fmt.Errorf("Cloudflare AAAA 更新需要 IPv6，但当前 IP 是 %s", ip)
+	}
+
+	ip = addr.String()
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.lastIP == ip {
+		return nil
+	}
+
+	if u.recordID == "" {
+		if err := u.findRecordIDLocked(); err != nil {
+			return err
+		}
+	}
+
+	payload := map[string]any{
+		"type":    "AAAA",
+		"name":    u.recordName,
+		"content": ip,
+		"proxied": u.proxied,
+	}
+	if u.ttl > 0 {
+		payload["ttl"] = u.ttl
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	apiURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", u.zoneID, u.recordID)
+	req, err := http.NewRequest(http.MethodPatch, apiURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+u.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("请求 Cloudflare API 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取 Cloudflare API 响应失败: %w", err)
+	}
+
+	var cfResp cloudflareDNSRecordResponse
+	if err := json.Unmarshal(respBody, &cfResp); err != nil {
+		return fmt.Errorf("解析 Cloudflare API 响应失败，HTTP %d，响应: %s", resp.StatusCode, string(respBody))
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !cfResp.Success {
+		return fmt.Errorf("Cloudflare AAAA 更新失败，HTTP %d，错误: %s，响应: %s", resp.StatusCode, formatCloudflareErrors(cfResp.Errors), string(respBody))
+	}
+
+	u.lastIP = ip
+	log.Printf("Cloudflare AAAA 记录已更新: %s -> %s", u.recordName, ip)
+	return nil
+}
+
+func (u *CloudflareDNSUpdater) findRecordIDLocked() error {
+	query := url.Values{}
+	query.Set("type", "AAAA")
+	query.Set("name", u.recordName)
+
+	apiURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?%s", u.zoneID, query.Encode())
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+u.token)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("查询 Cloudflare DNS 记录失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取 Cloudflare DNS 记录查询响应失败: %w", err)
+	}
+
+	var cfResp cloudflareDNSRecordListResponse
+	if err := json.Unmarshal(respBody, &cfResp); err != nil {
+		return fmt.Errorf("解析 Cloudflare DNS 记录查询响应失败，HTTP %d，响应: %s", resp.StatusCode, string(respBody))
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !cfResp.Success {
+		return fmt.Errorf("查询 Cloudflare DNS 记录失败，HTTP %d，错误: %s，响应: %s", resp.StatusCode, formatCloudflareErrors(cfResp.Errors), string(respBody))
+	}
+
+	if len(cfResp.Result) == 0 {
+		return fmt.Errorf("没有找到 Cloudflare AAAA 记录 %s，请先创建该记录，或使用 -cf-record-id 指定记录 ID", u.recordName)
+	}
+
+	u.recordID = cfResp.Result[0].ID
+	log.Printf("已找到 Cloudflare AAAA 记录 ID: %s (%s -> %s)", u.recordID, cfResp.Result[0].Name, cfResp.Result[0].Content)
+	return nil
+}
+
+func formatCloudflareErrors(errors []cloudflareAPIError) string {
+	if len(errors) == 0 {
+		return "无详细错误"
+	}
+
+	parts := make([]string, 0, len(errors))
+	for _, err := range errors {
+		parts = append(parts, fmt.Sprintf("%d: %s", err.Code, err.Message))
+	}
+	return strings.Join(parts, "; ")
+}
+
 func main() {
 	localAddr := flag.String("addr", "0.0.0.0:1234", "本地监听的 IP 和端口")
 	code := flag.Int("code", 200, "HTTP/HTTPS 响应状态码")
@@ -206,8 +392,22 @@ func main() {
 	random := flag.Bool("random", true, "是否随机生成IP，如果为false，则从CIDR中拆分出所有IP")
 	maxThreads := flag.Int("task", 100, "并发请求最大协程数")
 	useTLS := flag.Bool("tls", true, "是否为 TLS 端口")
+	cfEnable := flag.Bool("cf-enable", false, "是否启用 Cloudflare AAAA 记录更新")
+	cfToken := flag.String("cf-token", os.Getenv("CLOUDFLARE_API_TOKEN"), "Cloudflare API Token，也可用环境变量 CLOUDFLARE_API_TOKEN")
+	cfZoneID := flag.String("cf-zone-id", os.Getenv("CLOUDFLARE_ZONE_ID"), "Cloudflare Zone ID，也可用环境变量 CLOUDFLARE_ZONE_ID")
+	cfRecordID := flag.String("cf-record-id", os.Getenv("CLOUDFLARE_RECORD_ID"), "Cloudflare DNS Record ID，可选；为空时按记录名自动查询，也可用环境变量 CLOUDFLARE_RECORD_ID")
+	cfRecordName := flag.String("cf-record-name", "cf.48521.xyz", "需要更新的 Cloudflare AAAA 记录名")
+	cfProxied := flag.Bool("cf-proxied", false, "Cloudflare DNS 记录是否开启代理")
+	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
 
 	flag.Parse()
+
+	cfUpdater := NewCloudflareDNSUpdater(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfProxied, *cfTTL)
+	if cfUpdater.Enabled() {
+		log.Printf("Cloudflare AAAA 自动更新已启用，记录名: %s", *cfRecordName)
+	} else if *cfEnable {
+		log.Println("Cloudflare AAAA 自动更新未启用：请提供 -cf-token、-cf-zone-id，并确认 -cf-record-name 不为空")
+	}
 
 	ipManager := NewIPManager()
 
@@ -337,6 +537,9 @@ func main() {
 			continue
 		}
 		ipManager.SetCurrentIPWithIndex(currentIP, currentIndex)
+		if err := cfUpdater.UpdateIfChanged(currentIP); err != nil {
+			log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan bool)
@@ -346,7 +549,7 @@ func main() {
 
 		go func() {
 			defer loopWG.Done()
-			statusCheck(ctx, *useTLS, *port, done, *domain, *code, time.Duration(*Delay)*time.Millisecond, ipManager)
+			statusCheck(ctx, *useTLS, *port, done, *domain, *code, time.Duration(*Delay)*time.Millisecond, ipManager, cfUpdater)
 		}()
 
 		go func() {
@@ -846,7 +1049,7 @@ func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, c
 	return "", -1
 }
 
-func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager) {
+func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSUpdater) {
 	interval := 2 * time.Second
 	if delay > interval {
 		interval = delay
@@ -882,6 +1085,12 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 					done <- true
 					return
 				}
+
+				newIP := ipManager.GetCurrentIP()
+				if err := cfUpdater.UpdateIfChanged(newIP); err != nil {
+					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+				}
+
 				failCount = 0
 			}
 		}
