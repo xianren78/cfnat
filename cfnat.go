@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -71,7 +72,12 @@ func initRuntimeLogger(logFilePath string, debug bool) (*os.File, error) {
 	}
 
 	if debug {
-		log.SetOutput(io.MultiWriter(os.Stderr, file))
+		// 后台运行时，stderr 已经重定向到日志文件；这里直接写 file，避免重复写入。
+		if os.Getenv("CFNAT_DAEMONIZED") == "1" {
+			log.SetOutput(file)
+		} else {
+			log.SetOutput(io.MultiWriter(os.Stderr, file))
+		}
 	}
 
 	return file, nil
@@ -509,6 +515,87 @@ func formatCloudflareErrors(errors []cloudflareAPIError) string {
 	return strings.Join(parts, "; ")
 }
 
+func daemonize(logFilePath string, debug bool) (int, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("获取当前可执行文件路径失败: %w", err)
+	}
+
+	workDir, err := os.Getwd()
+	if err != nil {
+		return 0, fmt.Errorf("获取当前工作目录失败: %w", err)
+	}
+
+	stdinFile, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+	if err != nil {
+		return 0, fmt.Errorf("打开 %s 失败: %w", os.DevNull, err)
+	}
+	defer stdinFile.Close()
+
+	openNullWriter := func() (*os.File, error) {
+		return os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	}
+
+	openLogWriter := func() (*os.File, error) {
+		if strings.TrimSpace(logFilePath) == "" {
+			return openNullWriter()
+		}
+		return os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	}
+
+	var stdoutFile *os.File
+	var stderrFile *os.File
+
+	if debug {
+		stdoutFile, err = openLogWriter()
+		if err != nil {
+			return 0, fmt.Errorf("打开 stdout 日志文件失败: %w", err)
+		}
+		defer stdoutFile.Close()
+
+		stderrFile, err = openLogWriter()
+		if err != nil {
+			return 0, fmt.Errorf("打开 stderr 日志文件失败: %w", err)
+		}
+		defer stderrFile.Close()
+	} else {
+		// 非 debug 后台模式只通过 auditLog 写关键日志到 log-file，普通 stdout/stderr 丢弃，避免刷日志。
+		stdoutFile, err = openNullWriter()
+		if err != nil {
+			return 0, fmt.Errorf("打开 stdout 重定向失败: %w", err)
+		}
+		defer stdoutFile.Close()
+
+		stderrFile, err = openNullWriter()
+		if err != nil {
+			return 0, fmt.Errorf("打开 stderr 重定向失败: %w", err)
+		}
+		defer stderrFile.Close()
+	}
+
+	env := append(os.Environ(), "CFNAT_DAEMONIZED=1")
+	attr := &os.ProcAttr{
+		Dir:   workDir,
+		Env:   env,
+		Files: []*os.File{stdinFile, stdoutFile, stderrFile},
+		Sys: &syscall.SysProcAttr{
+			Setsid: true,
+		},
+	}
+
+	process, err := os.StartProcess(exePath, os.Args, attr)
+	if err != nil {
+		return 0, fmt.Errorf("启动后台进程失败: %w", err)
+	}
+
+	pid := process.Pid
+	if err := process.Release(); err != nil {
+		return pid, fmt.Errorf("释放后台进程失败: %w", err)
+	}
+
+	return pid, nil
+}
+
 func main() {
 	localAddr := flag.String("addr", "0.0.0.0:1234", "本地监听的 IP 和端口")
 	code := flag.Int("code", 200, "HTTP/HTTPS 响应状态码")
@@ -533,8 +620,18 @@ func main() {
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
 	logFile := flag.String("log-file", "cfnat.log", "日志文件路径；为空表示不写日志文件")
 	debugLog := flag.Bool("debug", false, "debug 模式：将全部 log 输出同时写入日志文件")
+	daemonMode := flag.Bool("d", false, "后台运行模式；父进程启动后台子进程后退出")
 
 	flag.Parse()
+
+	if *daemonMode && os.Getenv("CFNAT_DAEMONIZED") != "1" {
+		pid, err := daemonize(*logFile, *debugLog)
+		if err != nil {
+			log.Fatalf("后台运行启动失败: %v", err)
+		}
+		fmt.Printf("已后台运行，PID: %d，日志文件: %s\n", pid, *logFile)
+		return
+	}
 
 	logHandle, err := initRuntimeLogger(*logFile, *debugLog)
 	if err != nil {
@@ -542,7 +639,7 @@ func main() {
 	}
 	if logHandle != nil {
 		defer logHandle.Close()
-		auditLogf("日志文件已启用: %s，debug=%v", *logFile, *debugLog)
+		auditLogf("日志文件已启用: %s，debug=%v，daemon=%v", *logFile, *debugLog, os.Getenv("CFNAT_DAEMONIZED") == "1")
 	}
 
 	cfUpdater := NewCloudflareDNSUpdater(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfProxied, *cfTTL)
