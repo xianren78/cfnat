@@ -33,6 +33,7 @@ var (
 	validIPClientCache sync.Map
 	randomMu           sync.Mutex
 	randomGenerator    = rand.New(rand.NewSource(time.Now().UnixNano()))
+	runtimeLogger      *RuntimeLogger
 )
 
 // IPManager 用于安全管理 IP 地址状态
@@ -42,6 +43,97 @@ type IPManager struct {
 	ipAddresses   []string
 	currentIndex  int
 	allIPsChecked bool
+}
+
+// RuntimeLogger 控制重要日志与 debug 日志写入文件。
+// 非 debug 模式：只有 auditLogf/auditLogln 记录的重要运行日志会写入文件。
+// debug 模式：所有 log.Printf/log.Println/log.Fatalf 输出都会同时写入文件。
+type RuntimeLogger struct {
+	mu     sync.Mutex
+	debug  bool
+	logger *log.Logger
+}
+
+func initRuntimeLogger(logFilePath string, debug bool) (*os.File, error) {
+	logFilePath = strings.TrimSpace(logFilePath)
+	if logFilePath == "" {
+		return nil, nil
+	}
+
+	file, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	runtimeLogger = &RuntimeLogger{
+		debug:  debug,
+		logger: log.New(file, "", log.LstdFlags),
+	}
+
+	if debug {
+		log.SetOutput(io.MultiWriter(os.Stderr, file))
+	}
+
+	return file, nil
+}
+
+func auditLogf(format string, args ...interface{}) {
+	if runtimeLogger == nil {
+		log.Printf(format, args...)
+		return
+	}
+	runtimeLogger.Printf(format, args...)
+}
+
+func auditLogln(args ...interface{}) {
+	if runtimeLogger == nil {
+		log.Println(args...)
+		return
+	}
+	runtimeLogger.Println(args...)
+}
+
+func (l *RuntimeLogger) Printf(format string, args ...interface{}) {
+	if l == nil {
+		log.Printf(format, args...)
+		return
+	}
+
+	log.Printf(format, args...)
+	if l.debug {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logger.Printf(format, args...)
+}
+
+func (l *RuntimeLogger) Println(args ...interface{}) {
+	if l == nil {
+		log.Println(args...)
+		return
+	}
+
+	log.Println(args...)
+	if l.debug {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logger.Println(args...)
+}
+
+func logSelectedIPList(results []result, currentIP string, currentIndex int) {
+	auditLogf("启动选定 IP 列表：共 %d 个候选 IP，currentIP=%s，索引=%d", len(results), currentIP, currentIndex)
+	for i, r := range results {
+		mark := ""
+		if r.ip == currentIP {
+			mark = " <- currentIP"
+		}
+		auditLogf("候选IP[%d]%s IP=%s 数据中心=%s 地区=%s 城市=%s 延迟=%s", i, mark, r.ip, r.dataCenter, r.region, r.city, r.latency)
+	}
 }
 
 func NewIPManager() *IPManager {
@@ -201,7 +293,7 @@ func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, co
 			m.allIPsChecked = false
 			m.mu.Unlock()
 
-			log.Printf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, i)
+			auditLogf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, i)
 			return true
 		}
 	}
@@ -210,7 +302,7 @@ func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, co
 	m.allIPsChecked = true
 	m.mu.Unlock()
 
-	log.Println("所有 IP 都已检查过，程序将退出")
+	auditLogln("所有 IP 都已检查过，程序将退出")
 	return false
 }
 
@@ -307,6 +399,7 @@ func (u *CloudflareDNSUpdater) UpdateIfChanged(ip string) error {
 	defer u.mu.Unlock()
 
 	if u.lastIP == ip {
+		auditLogf("Cloudflare AAAA 记录未更新: %s 仍为 %s", u.recordName, ip)
 		return nil
 	}
 
@@ -360,7 +453,7 @@ func (u *CloudflareDNSUpdater) UpdateIfChanged(ip string) error {
 	}
 
 	u.lastIP = ip
-	log.Printf("Cloudflare AAAA 记录已更新: %s -> %s", u.recordName, ip)
+	auditLogf("Cloudflare AAAA 记录已更新: %s -> %s", u.recordName, ip)
 	return nil
 }
 
@@ -400,7 +493,7 @@ func (u *CloudflareDNSUpdater) findRecordIDLocked() error {
 	}
 
 	u.recordID = cfResp.Result[0].ID
-	log.Printf("已找到 Cloudflare AAAA 记录 ID: %s (%s -> %s)", u.recordID, cfResp.Result[0].Name, cfResp.Result[0].Content)
+	auditLogf("已找到 Cloudflare AAAA 记录 ID: %s (%s -> %s)", u.recordID, cfResp.Result[0].Name, cfResp.Result[0].Content)
 	return nil
 }
 
@@ -438,14 +531,25 @@ func main() {
 	cfRecordName := flag.String("cf-record-name", "cf.48521.xyz", "需要更新的 Cloudflare AAAA 记录名")
 	cfProxied := flag.Bool("cf-proxied", false, "Cloudflare DNS 记录是否开启代理")
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
+	logFile := flag.String("log-file", "cfnat.log", "日志文件路径；为空表示不写日志文件")
+	debugLog := flag.Bool("debug", false, "debug 模式：将全部 log 输出同时写入日志文件")
 
 	flag.Parse()
 
+	logHandle, err := initRuntimeLogger(*logFile, *debugLog)
+	if err != nil {
+		log.Fatalf("无法打开日志文件 %s: %v", *logFile, err)
+	}
+	if logHandle != nil {
+		defer logHandle.Close()
+		auditLogf("日志文件已启用: %s，debug=%v", *logFile, *debugLog)
+	}
+
 	cfUpdater := NewCloudflareDNSUpdater(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfProxied, *cfTTL)
 	if cfUpdater.Enabled() {
-		log.Printf("Cloudflare AAAA 自动更新已启用，记录名: %s", *cfRecordName)
+		auditLogf("Cloudflare AAAA 自动更新已启用，记录名: %s", *cfRecordName)
 	} else if *cfEnable {
-		log.Println("Cloudflare AAAA 自动更新未启用：请提供 -cf-token、-cf-zone-id，并确认 -cf-record-name 不为空")
+		auditLogln("Cloudflare AAAA 自动更新未启用：请提供 -cf-token、-cf-zone-id，并确认 -cf-record-name 不为空")
 	}
 
 	ipManager := NewIPManager()
@@ -456,7 +560,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("正在监听 %s，定时选路候选数：%d，选路间隔：%d 秒，切换阈值：%d ms，有效延迟：%d ms", *localAddr, *num, *routeInterval, *routeThreshold, *Delay)
+	auditLogf("正在监听 %s，定时选路候选数：%d，选路间隔：%d 秒，切换阈值：%d ms，有效延迟：%d ms", *localAddr, *num, *routeInterval, *routeThreshold, *Delay)
 
 	for {
 		startTime := time.Now()
@@ -576,8 +680,9 @@ func main() {
 			continue
 		}
 		ipManager.SetCurrentIPWithIndex(currentIP, currentIndex)
+		logSelectedIPList(results, currentIP, currentIndex)
 		if err := cfUpdater.UpdateIfChanged(currentIP); err != nil {
-			log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+			auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1103,11 +1208,12 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 	failCount := 0
 	wasUnhealthy := false
 	lastLoggedIP := ""
+	auditLogf("状态检查已启动：间隔=%d ms，失败阈值=2 次", interval.Milliseconds())
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("状态检查收到退出信号")
+			auditLogln("状态检查收到退出信号")
 			return
 		case <-ticker.C:
 			currentIP := ipManager.GetCurrentIP()
@@ -1115,11 +1221,11 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 				failCount++
 				wasUnhealthy = true
 				if failCount == 1 {
-					log.Println("状态检查异常: 当前没有可用 IP")
+					auditLogln("状态检查异常: 当前没有可用 IP")
 				}
 			} else if checkValidIP(currentIP, port, useTLS, domain, code) {
 				if wasUnhealthy || failCount > 0 || currentIP != lastLoggedIP {
-					log.Printf("状态检查正常: 当前 IP %s", currentIP)
+					auditLogf("状态检查正常: 当前 IP %s", currentIP)
 				}
 				failCount = 0
 				wasUnhealthy = false
@@ -1127,24 +1233,24 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 			} else {
 				failCount++
 				wasUnhealthy = true
-				log.Printf("状态检查失败 (%d/2)，当前 IP: %s", failCount, currentIP)
+				auditLogf("状态检查失败 (%d/2)，当前 IP: %s", failCount, currentIP)
 			}
 
 			if failCount >= 2 {
 				oldIP := currentIP
-				log.Printf("连续两次状态检查失败，准备切换 IP，当前 IP: %s", oldIP)
+				auditLogf("连续两次状态检查失败，准备切换 IP，当前 IP: %s", oldIP)
 
 				if !ipManager.switchToNextValidIP(useTLS, port, domain, code) {
-					log.Println("所有 IP 都已检查过，状态检查停止")
+					auditLogln("所有 IP 都已检查过，状态检查停止")
 					done <- true
 					return
 				}
 
 				newIP := ipManager.GetCurrentIP()
-				log.Printf("状态检查已切换 IP: %s -> %s", oldIP, newIP)
+				auditLogf("状态检查已切换 IP: %s -> %s", oldIP, newIP)
 
 				if err := cfUpdater.UpdateIfChanged(newIP); err != nil {
-					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+					auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
 				}
 
 				failCount = 0
@@ -1221,7 +1327,7 @@ func selectFastestIPByDial(ips []string, port int, delay time.Duration) (string,
 // 只有新 IP 比当前 currentIP 快超过 routeThreshold 时才切换；如果当前 IP 无法连接，则忽略阈值直接切换。
 func periodicRouteSelector(ctx context.Context, interval time.Duration, num int, port int, delay time.Duration, routeThreshold time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSUpdater) {
 	if interval <= 0 {
-		log.Println("定时选路已关闭")
+		auditLogln("定时选路已关闭")
 		<-ctx.Done()
 		return
 	}
@@ -1230,31 +1336,43 @@ func periodicRouteSelector(ctx context.Context, interval time.Duration, num int,
 		routeThreshold = 0
 	}
 
-	runSelect := func() {
+	runSelect := func(reason string) {
 		candidates := ipManager.GetCandidateIPs(num)
+		currentIP := ipManager.GetCurrentIP()
+
+		auditLogf(
+			"定时选路开始：原因=%s，候选数=%d，currentIP=%s，连接超时=%d ms，切换阈值=%d ms",
+			reason,
+			len(candidates),
+			currentIP,
+			delay.Milliseconds(),
+			routeThreshold.Milliseconds(),
+		)
+
 		if len(candidates) == 0 {
+			auditLogln("定时选路结束：没有候选 IP")
 			return
 		}
 
-		currentIP := ipManager.GetCurrentIP()
-
 		bestIP, bestDelay, ok := selectFastestIPByDial(candidates, port, delay)
 		if !ok {
-			log.Printf("定时选路失败：%d 个候选 IP 均无法在 %d ms 内连接", len(candidates), delay.Milliseconds())
+			auditLogf("定时选路失败：%d 个候选 IP 均无法在 %d ms 内连接", len(candidates), delay.Milliseconds())
 			return
 		}
 
 		if currentIP == "" {
 			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
 			if !found {
-				log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+				auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
 				return
 			}
 			if changed {
-				log.Printf("定时选路设置当前 IP: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
+				auditLogf("定时选路设置当前 IP: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
 				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+					auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
 				}
+			} else {
+				auditLogf("定时选路结束：currentIP 为空但 SetCurrentIP 未发生变化，bestIP=%s", bestIP)
 			}
 			return
 		}
@@ -1262,49 +1380,64 @@ func periodicRouteSelector(ctx context.Context, interval time.Duration, num int,
 		currentDelay, currentOK := measureIPDelay(currentIP, port, delay)
 		if !currentOK {
 			if bestIP == currentIP {
+				auditLogf("定时选路结束：当前 IP %s 检测失败，但最快候选仍是当前 IP，保持不变", currentIP)
 				return
 			}
 
 			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
 			if !found {
-				log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+				auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
 				return
 			}
 
 			if changed {
-				log.Printf("定时选路检测到当前 IP 不可用，切换到: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
+				auditLogf("定时选路检测到当前 IP 不可用，切换到: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
 				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+					auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
 				}
+			} else {
+				auditLogf("定时选路结束：当前 IP 不可用，但目标 IP 未变化: %s", bestIP)
 			}
 			return
 		}
 
 		if bestIP == currentIP {
+			auditLogf("定时选路完成：保持当前 IP %s，当前延迟 %d ms，最快候选延迟 %d ms", currentIP, currentDelay.Milliseconds(), bestDelay.Milliseconds())
 			return
 		}
 
 		improvement := currentDelay - bestDelay
 		if improvement <= routeThreshold {
+			auditLogf(
+				"定时选路完成：保持当前 IP %s，新候选 %s，当前延迟 %d ms，新延迟 %d ms，改善 %d ms，未超过阈值 %d ms",
+				currentIP,
+				bestIP,
+				currentDelay.Milliseconds(),
+				bestDelay.Milliseconds(),
+				improvement.Milliseconds(),
+				routeThreshold.Milliseconds(),
+			)
 			return
 		}
 
 		changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
 		if !found {
-			log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+			auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
 			return
 		}
 
 		if changed {
-			log.Printf("定时选路更新当前 IP: %s -> %s，延迟 %d ms -> %d ms，改善 %d ms，超过阈值 %d ms，索引 %d", currentIP, bestIP, currentDelay.Milliseconds(), bestDelay.Milliseconds(), improvement.Milliseconds(), routeThreshold.Milliseconds(), index)
+			auditLogf("定时选路更新当前 IP: %s -> %s，延迟 %d ms -> %d ms，改善 %d ms，超过阈值 %d ms，索引 %d", currentIP, bestIP, currentDelay.Milliseconds(), bestDelay.Milliseconds(), improvement.Milliseconds(), routeThreshold.Milliseconds(), index)
 			if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-				log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+				auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
 			}
+		} else {
+			auditLogf("定时选路完成：目标 IP 与当前记录一致，保持 %s", bestIP)
 		}
 	}
 
 	// 启动后立即选一次，后续每 interval 选一次。
-	runSelect()
+	runSelect("startup")
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1312,10 +1445,10 @@ func periodicRouteSelector(ctx context.Context, interval time.Duration, num int,
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("定时选路收到退出信号")
+			auditLogln("定时选路收到退出信号")
 			return
 		case <-ticker.C:
-			runSelect()
+			runSelect("interval")
 		}
 	}
 }
