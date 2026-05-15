@@ -128,6 +128,43 @@ func (m *IPManager) GetTargetIPs(num int) []string {
 	return targets
 }
 
+// GetCandidateIPs 返回定时选路使用的候选 IP。
+// 这里直接取扫描排序后的前 num 个 IP，避免每个客户端连接再做多 IP 竞争。
+func (m *IPManager) GetCandidateIPs(num int) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if num <= 0 {
+		num = 1
+	}
+	if num > len(m.ipAddresses) {
+		num = len(m.ipAddresses)
+	}
+
+	ips := make([]string, num)
+	copy(ips, m.ipAddresses[:num])
+	return ips
+}
+
+// SetCurrentIPByValue 根据 IP 值更新 currentIP，同时修正 currentIndex。
+// 返回值：是否发生变化、索引、是否找到该 IP。
+func (m *IPManager) SetCurrentIPByValue(ip string) (bool, int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, item := range m.ipAddresses {
+		if item == ip {
+			changed := m.currentIP != ip
+			m.currentIP = ip
+			m.currentIndex = i
+			m.allIPsChecked = false
+			return changed, i, true
+		}
+	}
+
+	return false, -1, false
+}
+
 func (m *IPManager) IsAllIPsChecked() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -387,7 +424,9 @@ func main() {
 	domain := flag.String("domain", "cloudflaremirrors.com/debian", "响应状态码检查的域名地址")
 	ipCount := flag.Int("ipnum", 20, "提取的有效IP数量")
 	ipsType := flag.String("ips", "4", "指定生成IPv4还是IPv6地址 (4或6)")
-	num := flag.Int("num", 5, "每个客户端连接并发尝试的候选目标 IP 数量")
+	num := flag.Int("num", 5, "定时选路时并发尝试的候选目标 IP 数量")
+	routeInterval := flag.Int("route-interval", 60, "主动筛选最佳 IP 的间隔秒数；小于等于 0 表示关闭定时选路")
+	routeThreshold := flag.Int("route-threshold", 50, "定时选路切换阈值毫秒；新 IP 比当前 IP 快超过该值才切换")
 	port := flag.Int("port", 443, "转发的目标端口")
 	random := flag.Bool("random", true, "是否随机生成IP，如果为false，则从CIDR中拆分出所有IP")
 	maxThreads := flag.Int("task", 100, "并发请求最大协程数")
@@ -417,7 +456,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("正在监听 %s，每个客户端最多并发尝试 %d 个候选目标 IP，有效延迟：%d ms", *localAddr, *num, *Delay)
+	log.Printf("正在监听 %s，定时选路候选数：%d，选路间隔：%d 秒，切换阈值：%d ms，有效延迟：%d ms", *localAddr, *num, *routeInterval, *routeThreshold, *Delay)
 
 	for {
 		startTime := time.Now()
@@ -545,11 +584,16 @@ func main() {
 		done := make(chan bool)
 
 		var loopWG sync.WaitGroup
-		loopWG.Add(2)
+		loopWG.Add(3)
 
 		go func() {
 			defer loopWG.Done()
 			statusCheck(ctx, *useTLS, *port, done, *domain, *code, time.Duration(*Delay)*time.Millisecond, ipManager, cfUpdater)
+		}()
+
+		go func() {
+			defer loopWG.Done()
+			periodicRouteSelector(ctx, time.Duration(*routeInterval)*time.Second, *num, *port, time.Duration(*Delay)*time.Millisecond, time.Duration(*routeThreshold)*time.Millisecond, ipManager, cfUpdater)
 		}()
 
 		go func() {
@@ -579,15 +623,15 @@ func main() {
 					atomic.AddInt32(&activeConnections, 1)
 					log.Printf("客户端来源: %s 连接建立，当前活跃连接数: %d", clientAddr, atomic.LoadInt32(&activeConnections))
 
-					targetIPs := ipManager.GetTargetIPs(*num)
-					if len(targetIPs) == 0 {
-						log.Println("当前没有可用候选目标 IP，关闭客户端连接")
+					currentIP := ipManager.GetCurrentIP()
+					if currentIP == "" {
+						log.Println("当前没有可用目标 IP，关闭客户端连接")
 						conn.Close()
 						atomic.AddInt32(&activeConnections, -1)
 						continue
 					}
 
-					go handleConnection(conn, generateTargets(targetIPs, *port), time.Duration(*Delay)*time.Millisecond)
+					go handleConnection(conn, []string{makeTargetAddr(currentIP, *port)}, time.Duration(*Delay)*time.Millisecond)
 				}
 			}
 		}()
@@ -968,6 +1012,10 @@ func incrementIP(ip net.IP) {
 	}
 }
 
+func makeTargetAddr(ip string, port int) string {
+	return net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+}
+
 func generateTargets(ips []string, port int) []string {
 	targets := make([]string, 0, len(ips))
 	seen := make(map[string]struct{}, len(ips))
@@ -981,7 +1029,7 @@ func generateTargets(ips []string, port int) []string {
 			continue
 		}
 		seen[ip] = struct{}{}
-		targets = append(targets, net.JoinHostPort(ip, fmt.Sprintf("%d", port)))
+		targets = append(targets, makeTargetAddr(ip, port))
 	}
 
 	return targets
@@ -1107,6 +1155,171 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 	}
 }
 
+func measureIPDelay(ip string, port int, delay time.Duration) (time.Duration, bool) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return 0, false
+	}
+
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", makeTargetAddr(ip, port), delay)
+	elapsed := time.Since(start)
+	if err != nil {
+		return elapsed, false
+	}
+	conn.Close()
+	return elapsed, true
+}
+
+func selectFastestIPByDial(ips []string, port int, delay time.Duration) (string, time.Duration, bool) {
+	if len(ips) == 0 {
+		return "", 0, false
+	}
+
+	type dialResult struct {
+		ip    string
+		delay time.Duration
+		ok    bool
+	}
+
+	results := make(chan dialResult, len(ips))
+
+	for _, ip := range ips {
+		ip := strings.TrimSpace(ip)
+		if ip == "" {
+			results <- dialResult{}
+			continue
+		}
+
+		go func(candidateIP string) {
+			elapsed, ok := measureIPDelay(candidateIP, port, delay)
+			results <- dialResult{ip: candidateIP, delay: elapsed, ok: ok}
+		}(ip)
+	}
+
+	var bestIP string
+	var bestDelay time.Duration
+
+	for i := 0; i < len(ips); i++ {
+		res := <-results
+		if !res.ok {
+			continue
+		}
+		if bestIP == "" || res.delay < bestDelay {
+			bestIP = res.ip
+			bestDelay = res.delay
+		}
+	}
+
+	if bestIP == "" {
+		return "", 0, false
+	}
+	return bestIP, bestDelay, true
+}
+
+// periodicRouteSelector 每隔固定时间主动从候选 IP 中选出 TCP 建连最快的 IP。
+// 只有新 IP 比当前 currentIP 快超过 routeThreshold 时才切换；如果当前 IP 无法连接，则忽略阈值直接切换。
+func periodicRouteSelector(ctx context.Context, interval time.Duration, num int, port int, delay time.Duration, routeThreshold time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSUpdater) {
+	if interval <= 0 {
+		log.Println("定时选路已关闭")
+		<-ctx.Done()
+		return
+	}
+
+	if routeThreshold < 0 {
+		routeThreshold = 0
+	}
+
+	runSelect := func() {
+		candidates := ipManager.GetCandidateIPs(num)
+		if len(candidates) == 0 {
+			return
+		}
+
+		currentIP := ipManager.GetCurrentIP()
+
+		bestIP, bestDelay, ok := selectFastestIPByDial(candidates, port, delay)
+		if !ok {
+			log.Printf("定时选路失败：%d 个候选 IP 均无法在 %d ms 内连接", len(candidates), delay.Milliseconds())
+			return
+		}
+
+		if currentIP == "" {
+			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
+			if !found {
+				log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+				return
+			}
+			if changed {
+				log.Printf("定时选路设置当前 IP: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
+				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
+					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+				}
+			}
+			return
+		}
+
+		currentDelay, currentOK := measureIPDelay(currentIP, port, delay)
+		if !currentOK {
+			if bestIP == currentIP {
+				return
+			}
+
+			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
+			if !found {
+				log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+				return
+			}
+
+			if changed {
+				log.Printf("定时选路检测到当前 IP 不可用，切换到: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
+				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
+					log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+				}
+			}
+			return
+		}
+
+		if bestIP == currentIP {
+			return
+		}
+
+		improvement := currentDelay - bestDelay
+		if improvement <= routeThreshold {
+			return
+		}
+
+		changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
+		if !found {
+			log.Printf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
+			return
+		}
+
+		if changed {
+			log.Printf("定时选路更新当前 IP: %s -> %s，延迟 %d ms -> %d ms，改善 %d ms，超过阈值 %d ms，索引 %d", currentIP, bestIP, currentDelay.Milliseconds(), bestDelay.Milliseconds(), improvement.Milliseconds(), routeThreshold.Milliseconds(), index)
+			if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
+				log.Printf("更新 Cloudflare AAAA 记录失败: %v", err)
+			}
+		}
+	}
+
+	// 启动后立即选一次，后续每 interval 选一次。
+	runSelect()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("定时选路收到退出信号")
+			return
+		case <-ticker.C:
+			runSelect()
+		}
+	}
+}
+
 // 处理客户端连接，尝试连接到指定的转发地址，并选择延迟最低的连接
 func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration) {
 	defer func() {
@@ -1118,6 +1331,16 @@ func handleConnection(conn net.Conn, forwardAddrs []string, delay time.Duration)
 
 	if len(forwardAddrs) == 0 {
 		log.Println("未提供转发地址，关闭客户端连接")
+		return
+	}
+
+	if len(forwardAddrs) == 1 {
+		forwardConn, err := net.DialTimeout("tcp", forwardAddrs[0], delay)
+		if err != nil {
+			log.Printf("连接到当前 IP 失败: %s，错误: %v", forwardAddrs[0], err)
+			return
+		}
+		pipeConnections(conn, forwardConn)
 		return
 	}
 
