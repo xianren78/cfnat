@@ -343,6 +343,85 @@ type CloudflareDNSUpdater struct {
 	lastIP     string
 }
 
+
+// CloudflareDNSGroup 为每个域名维护独立记录 ID 和更新缓存。
+// 多域名模式严格对应扫描排序后的候选列表，不受 currentIP 切换影响。
+type CloudflareDNSGroup struct {
+	updaters []*CloudflareDNSUpdater
+	manager *IPManager
+	multi bool
+	mu sync.Mutex
+}
+
+func newCloudflareDNSGroup(enabled bool, token, zoneID, recordID, recordName, namesCSV, idsCSV string, proxied bool, ttl int, manager *IPManager) (*CloudflareDNSGroup, error) {
+	g := &CloudflareDNSGroup{manager: manager, multi: strings.TrimSpace(namesCSV) != ""}
+	if !enabled { return g, nil }
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(zoneID) == "" {
+		return nil, fmt.Errorf("启用 DDNS 必须提供 cf-token 和 cf-zone-id")
+	}
+	names := []string{recordName}
+	ids := []string{recordID}
+	if g.multi {
+		names = strings.Split(namesCSV, ",")
+		ids = make([]string, len(names))
+		if strings.TrimSpace(recordID) != "" {
+			return nil, fmt.Errorf("多域名模式请使用 cf-record-ids，不能使用 cf-record-id")
+		}
+		if strings.TrimSpace(idsCSV) != "" {
+			ids = strings.Split(idsCSV, ",")
+			if len(ids) != len(names) { return nil, fmt.Errorf("cf-record-ids 数量必须与 cf-record-names 一致，可用空项自动查询") }
+		}
+	} else if strings.TrimSpace(idsCSV) != "" {
+		return nil, fmt.Errorf("cf-record-ids 必须配合 cf-record-names 使用")
+	}
+	seen := make(map[string]bool)
+	for i, name := range names {
+		name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+		if name == "" || seen[name] { return nil, fmt.Errorf("第 %d 个域名为空或重复: %q", i+1, name) }
+		seen[name] = true
+		g.updaters = append(g.updaters, NewCloudflareDNSUpdater(true, token, zoneID, ids[i], name, proxied, ttl))
+	}
+	return g, nil
+}
+
+func (g *CloudflareDNSGroup) Enabled() bool { return g != nil && len(g.updaters) > 0 }
+
+func (g *CloudflareDNSGroup) UpdateIfChanged(currentIP string) error {
+	if !g.Enabled() { return nil }
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ips := []string{currentIP}
+	if g.multi { ips = g.manager.GetCandidateIPs(len(g.updaters)) }
+	var failures []string
+	for i, updater := range g.updaters {
+		if i >= len(ips) {
+			auditLogf("Cloudflare AAAA 跳过 %s：候选 IP 不足（需要第 %d 个，现有 %d 个），保留原记录", updater.recordName, i+1, len(ips))
+			continue
+		}
+		if err := updater.UpdateIfChanged(ips[i]); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", updater.recordName, err))
+		}
+	}
+	if len(failures) > 0 { return fmt.Errorf("%s", strings.Join(failures, "; ")) }
+	return nil
+}
+
+// 独立重试，避免转发 IP 未变化时失败的域名一直得不到重试。
+func (g *CloudflareDNSGroup) run(ctx context.Context) {
+	if !g.Enabled() || !g.multi { return }
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done(): return
+		case <-ticker.C:
+			if err := g.UpdateIfChanged(g.manager.GetCurrentIP()); err != nil {
+				auditLogf("多域名 DDNS 更新失败，将在下次重试: %v", err)
+			}
+		}
+	}
+}
+
 type cloudflareDNSRecord struct {
 	ID      string `json:"id"`
 	Type    string `json:"type"`
@@ -498,6 +577,9 @@ func (u *CloudflareDNSUpdater) findRecordIDLocked() error {
 		return fmt.Errorf("没有找到 Cloudflare AAAA 记录 %s，请先创建该记录，或使用 -cf-record-id 指定记录 ID", u.recordName)
 	}
 
+	if len(cfResp.Result) != 1 {
+		return fmt.Errorf("域名 %s 存在多个 AAAA 记录，请显式指定对应的记录 ID", u.recordName)
+	}
 	u.recordID = cfResp.Result[0].ID
 	auditLogf("已找到 Cloudflare AAAA 记录 ID: %s (%s -> %s)", u.recordID, cfResp.Result[0].Name, cfResp.Result[0].Content)
 	return nil
@@ -616,6 +698,8 @@ func main() {
 	cfZoneID := flag.String("cf-zone-id", os.Getenv("CLOUDFLARE_ZONE_ID"), "Cloudflare Zone ID，也可用环境变量 CLOUDFLARE_ZONE_ID")
 	cfRecordID := flag.String("cf-record-id", os.Getenv("CLOUDFLARE_RECORD_ID"), "Cloudflare DNS Record ID，可选；为空时按记录名自动查询，也可用环境变量 CLOUDFLARE_RECORD_ID")
 	cfRecordName := flag.String("cf-record-name", "cf.48521.xyz", "需要更新的 Cloudflare AAAA 记录名")
+	cfRecordNames := flag.String("cf-record-names", "", "多个 AAAA 域名，用逗号分隔，依次对应候选列表前 N 个 IP；优先于 cf-record-name")
+	cfRecordIDs := flag.String("cf-record-ids", "", "可选：与 cf-record-names 顺序对应的记录 ID，逗号分隔，空项自动查询")
 	cfProxied := flag.Bool("cf-proxied", false, "Cloudflare DNS 记录是否开启代理")
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
 	logFile := flag.String("log-file", "cfnat.log", "日志文件路径；为空表示不写日志文件")
@@ -642,14 +726,15 @@ func main() {
 		auditLogf("日志文件已启用: %s，debug=%v，daemon=%v", *logFile, *debugLog, os.Getenv("CFNAT_DAEMONIZED") == "1")
 	}
 
-	cfUpdater := NewCloudflareDNSUpdater(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfProxied, *cfTTL)
-	if cfUpdater.Enabled() {
-		auditLogf("Cloudflare AAAA 自动更新已启用，记录名: %s", *cfRecordName)
-	} else if *cfEnable {
-		auditLogln("Cloudflare AAAA 自动更新未启用：请提供 -cf-token、-cf-zone-id，并确认 -cf-record-name 不为空")
-	}
-
 	ipManager := NewIPManager()
+	cfUpdater, err := newCloudflareDNSGroup(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfRecordNames, *cfRecordIDs, *cfProxied, *cfTTL, ipManager)
+	if err != nil { log.Fatalf("Cloudflare DDNS 配置错误: %v", err) }
+	if cfUpdater.Enabled() {
+		if *ipsType != "6" { log.Fatal("Cloudflare AAAA 更新需要 -ips 6") }
+		for i, updater := range cfUpdater.updaters {
+			auditLogf("Cloudflare AAAA 自动更新已启用：域名[%d]=%s，多域名候选映射=%v", i+1, updater.recordName, cfUpdater.multi)
+		}
+	}
 
 	listener, err := net.Listen("tcp", *localAddr)
 	if err != nil {
@@ -786,7 +871,11 @@ func main() {
 		done := make(chan bool)
 
 		var loopWG sync.WaitGroup
-		loopWG.Add(3)
+		loopWG.Add(4)
+		go func() {
+			defer loopWG.Done()
+			cfUpdater.run(ctx)
+		}()
 
 		go func() {
 			defer loopWG.Done()
@@ -1293,7 +1382,7 @@ func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, c
 	return "", -1
 }
 
-func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSUpdater) {
+func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, domain string, code int, delay time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSGroup) {
 	interval := 2 * time.Second
 	if delay > interval {
 		interval = delay
@@ -1422,7 +1511,7 @@ func selectFastestIPByDial(ips []string, port int, delay time.Duration) (string,
 
 // periodicRouteSelector 每隔固定时间主动从候选 IP 中选出 TCP 建连最快的 IP。
 // 只有新 IP 比当前 currentIP 快超过 routeThreshold 时才切换；如果当前 IP 无法连接，则忽略阈值直接切换。
-func periodicRouteSelector(ctx context.Context, interval time.Duration, num int, port int, delay time.Duration, routeThreshold time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSUpdater) {
+func periodicRouteSelector(ctx context.Context, interval time.Duration, num int, port int, delay time.Duration, routeThreshold time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSGroup) {
 	if interval <= 0 {
 		auditLogln("定时选路已关闭")
 		<-ctx.Done()
