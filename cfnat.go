@@ -156,6 +156,25 @@ func (m *IPManager) SetIPAddresses(ips []string) {
 	m.allIPsChecked = false
 }
 
+// ReplaceCandidates 更新排序但保留当前转发 IP，并同步其索引。
+func (m *IPManager) ReplaceCandidates(ips []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ipAddresses = append([]string(nil), ips...)
+	m.currentIndex = -1
+	for i, ip := range m.ipAddresses {
+		if ip == m.currentIP {
+			m.currentIndex = i
+			break
+		}
+	}
+	if m.currentIP != "" && m.currentIndex < 0 {
+		m.currentIndex = len(m.ipAddresses)
+		m.ipAddresses = append(m.ipAddresses, m.currentIP)
+	}
+	m.allIPsChecked = false
+}
+
 func (m *IPManager) GetCurrentIP() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -286,20 +305,19 @@ func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, co
 	currentIP := m.currentIP
 	m.mu.RUnlock()
 
-	for i := startIndex; i < len(ips); i++ {
+	for offset := 0; offset < len(ips); offset++ {
+		i := (startIndex + offset) % len(ips)
 		ip := ips[i]
 		if ip == currentIP {
 			continue
 		}
 
 		if checkValidIP(ip, port, useTLS, domain, code) {
-			m.mu.Lock()
-			m.currentIP = ip
-			m.currentIndex = i
-			m.allIPsChecked = false
-			m.mu.Unlock()
-
-			auditLogf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, i)
+			_, index, found := m.SetCurrentIPByValue(ip)
+			if !found {
+				continue
+			}
+			auditLogf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, index)
 			return true
 		}
 	}
@@ -343,26 +361,25 @@ type CloudflareDNSUpdater struct {
 	lastIP     string
 }
 
-
 // CloudflareDNSGroup 为每个域名维护独立记录 ID 和更新缓存。
 // 多域名模式使用健康检测后按延迟排序的独立分配列表。
 type CloudflareDNSGroup struct {
-	updaters []*CloudflareDNSUpdater
-	manager *IPManager
-	multi bool
-	mu sync.Mutex
-	refreshMu sync.Mutex
-	health map[string]ddnsHealth
-	ranked []string
-	rescan func() []string
-	lastScan time.Time
-	probe func(string) (time.Duration, bool)
-
+	updaters       []*CloudflareDNSUpdater
+	manager        *IPManager
+	multi          bool
+	mu             sync.Mutex
+	refreshMu      sync.Mutex
+	health         map[string]ddnsHealth
+	rescan         func(context.Context) []string
+	candidateLimit int
+	probe          func(string) (time.Duration, bool)
 }
 
 func newCloudflareDNSGroup(enabled bool, token, zoneID, recordID, recordName, namesCSV, idsCSV string, proxied bool, ttl int, manager *IPManager) (*CloudflareDNSGroup, error) {
 	g := &CloudflareDNSGroup{manager: manager, multi: strings.TrimSpace(namesCSV) != ""}
-	if !enabled { return g, nil }
+	if !enabled {
+		return g, nil
+	}
 	if strings.TrimSpace(token) == "" || strings.TrimSpace(zoneID) == "" {
 		return nil, fmt.Errorf("启用 DDNS 必须提供 cf-token 和 cf-zone-id")
 	}
@@ -376,7 +393,9 @@ func newCloudflareDNSGroup(enabled bool, token, zoneID, recordID, recordName, na
 		}
 		if strings.TrimSpace(idsCSV) != "" {
 			ids = strings.Split(idsCSV, ",")
-			if len(ids) != len(names) { return nil, fmt.Errorf("cf-record-ids 数量必须与 cf-record-names 一致，可用空项自动查询") }
+			if len(ids) != len(names) {
+				return nil, fmt.Errorf("cf-record-ids 数量必须与 cf-record-names 一致，可用空项自动查询")
+			}
 		}
 	} else if strings.TrimSpace(idsCSV) != "" {
 		return nil, fmt.Errorf("cf-record-ids 必须配合 cf-record-names 使用")
@@ -384,7 +403,9 @@ func newCloudflareDNSGroup(enabled bool, token, zoneID, recordID, recordName, na
 	seen := make(map[string]bool)
 	for i, name := range names {
 		name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
-		if name == "" || seen[name] { return nil, fmt.Errorf("第 %d 个域名为空或重复: %q", i+1, name) }
+		if name == "" || seen[name] {
+			return nil, fmt.Errorf("第 %d 个域名为空或重复: %q", i+1, name)
+		}
 		seen[name] = true
 		g.updaters = append(g.updaters, NewCloudflareDNSUpdater(true, token, zoneID, ids[i], name, proxied, ttl))
 	}
@@ -393,119 +414,265 @@ func newCloudflareDNSGroup(enabled bool, token, zoneID, recordID, recordName, na
 
 func (g *CloudflareDNSGroup) Enabled() bool { return g != nil && len(g.updaters) > 0 }
 
+// UpdateIfChanged 仅用于单域名初始化和故障切换。
+// 多域名更新统一由定时检测按延迟差值决定，避免其它路径绕过阈值。
 func (g *CloudflareDNSGroup) UpdateIfChanged(currentIP string) error {
-	if !g.Enabled() { return nil }
+	if !g.Enabled() || g.multi {
+		return nil
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	ips := []string{currentIP}
-	if g.multi { ips = append([]string(nil), g.ranked...) }
-	var failures []string
-	for i, updater := range g.updaters {
-		if i >= len(ips) {
-			auditLogf("Cloudflare AAAA 跳过 %s：候选 IP 不足（需要第 %d 个，现有 %d 个），保留原记录", updater.recordName, i+1, len(ips))
-			continue
-		}
-		if err := updater.UpdateIfChanged(ips[i]); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", updater.recordName, err))
-		}
-	}
-	if len(failures) > 0 { return fmt.Errorf("%s", strings.Join(failures, "; ")) }
-	return nil
+	return g.updaters[0].UpdateIfChanged(currentIP)
 }
 
 type ddnsHealth struct {
 	failures int
-	latency time.Duration
-	known bool
+	latency  time.Duration
+	known    bool
 }
 
-// applyHealth 保留首次失败的已知有效项，连续两次失败后暂停分配。
-// 从未检测成功的地址不会进入分配列表；恢复成功时立即重新参与排名。
-func (g *CloudflareDNSGroup) applyHealth(ips []string, observations map[string]ddnsHealth) []string {
-	if g.health == nil { g.health = make(map[string]ddnsHealth) }
-	var eligible []string
-	seen := make(map[string]bool)
-	for _, ip := range ips {
-		if seen[ip] { continue }; seen[ip] = true
-		state := g.health[ip]
-		obs := observations[ip]
-		if obs.known {
-			if state.failures >= 2 { auditLogf("DDNS IP 恢复: %s", ip) }
-			state = ddnsHealth{latency: obs.latency, known: true}
-		} else {
-			if state.failures < 2 { state.failures++ }
-			if state.failures == 2 && g.health[ip].failures < 2 { auditLogf("DDNS IP 连续失败两轮，暂停分配: %s", ip) }
-		}
-		g.health[ip] = state
-		if state.known && state.failures < 2 { eligible = append(eligible, ip) }
+func (u *CloudflareDNSUpdater) currentIP() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastIP
+}
+
+// probeIPs 检测全部地址，concurrency 仅限制并发数，不限制检测范围。
+func (g *CloudflareDNSGroup) probeIPs(ctx context.Context, ips []string, concurrency int) map[string]ddnsHealth {
+	if concurrency < 1 {
+		concurrency = 1
 	}
-	sort.SliceStable(eligible, func(i, j int) bool { return g.health[eligible[i]].latency < g.health[eligible[j]].latency })
-	return eligible
-}
-
-func (g *CloudflareDNSGroup) refresh(ctx context.Context) {
-	if !g.Enabled() || !g.multi { return }
-	g.refreshMu.Lock()
-	defer g.refreshMu.Unlock()
-	probeAll := func(ips []string) map[string]ddnsHealth {
-		observed := make(map[string]ddnsHealth)
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 16)
-		for _, ip := range ips {
-			if ctx.Err() != nil { break }
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(ip string) {
-				defer wg.Done(); defer func() { <-sem }()
-				elapsed, ok := g.probe(ip)
-				mu.Lock(); observed[ip] = ddnsHealth{latency: elapsed, known: ok}; mu.Unlock()
-			}(ip)
-		}
-		wg.Wait()
+	observed := make(map[string]ddnsHealth)
+	if g.probe == nil {
 		return observed
 	}
-	ips := g.manager.GetIPAddresses()
-	observations := probeAll(ips)
-	if ctx.Err() != nil { return }
-	eligible := g.applyHealth(ips, observations)
-	if len(eligible) < len(g.updaters) && g.rescan != nil && time.Since(g.lastScan) >= 60*time.Second {
-		g.lastScan = time.Now()
-		auditLogf("DDNS 可分配 IP 不足（%d/%d），重新扫描补充", len(eligible), len(g.updaters))
-		fresh := g.rescan()
-		if ctx.Err() != nil { return }
-		seen := make(map[string]bool)
-		for _, ip := range ips { seen[ip] = true }
-		var added []string
-		for _, ip := range fresh { if !seen[ip] { seen[ip] = true; added = append(added, ip) } }
-		// 本轮只探测新增项，已有项不能因补充扫描被重复计为两轮失败。
-		newObservations := probeAll(added)
-		if ctx.Err() != nil { return }
-		newEligible := g.applyHealth(added, newObservations)
-		eligible = append(eligible, newEligible...)
-		sort.SliceStable(eligible, func(i,j int) bool { return g.health[eligible[i]].latency < g.health[eligible[j]].latency })
-		g.manager.mu.Lock()
-		g.manager.ipAddresses = append(g.manager.ipAddresses, added...)
-		g.manager.mu.Unlock()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	seen := make(map[string]bool)
+loop:
+	for _, ip := range ips {
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break loop
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			elapsed, ok := g.probe(ip)
+			mu.Lock()
+			observed[ip] = ddnsHealth{latency: elapsed, known: ok}
+			mu.Unlock()
+		}(ip)
 	}
-	g.mu.Lock()
-	g.ranked = append([]string(nil), eligible...)
-	g.mu.Unlock()
-	auditLogf("DDNS 本轮可分配 IP: %v", eligible)
-	if err := g.UpdateIfChanged(g.manager.GetCurrentIP()); err != nil { auditLogf("多域名 DDNS 更新失败，将重试: %v", err) }
+	wg.Wait()
+	return observed
 }
 
-// 选路开启时由选路周期刷新；关闭时仍每 60 秒检测并刷新 DDNS。
-func (g *CloudflareDNSGroup) run(ctx context.Context, interval time.Duration) {
-	if !g.Enabled() || !g.multi { return }
-	if interval > 0 { <-ctx.Done(); return }
-	g.refresh(ctx)
+// 本轮成功项才能参与排名；旧域名 IP 保留连续两轮失败的容错。
+func (g *CloudflareDNSGroup) applyHealth(observations map[string]ddnsHealth) {
+	if g.health == nil {
+		g.health = make(map[string]ddnsHealth)
+	}
+	for ip, obs := range observations {
+		state := g.health[ip]
+		if obs.known {
+			state = ddnsHealth{latency: obs.latency, known: true}
+		} else if state.failures < 2 {
+			state.failures++
+		}
+		g.health[ip] = state
+	}
+}
+
+func rankAvailableIPs(ips []string, observations map[string]ddnsHealth) []string {
+	var ranked []string
+	seen := make(map[string]bool)
+	for _, ip := range ips {
+		if !seen[ip] && observations[ip].known {
+			seen[ip] = true
+			ranked = append(ranked, ip)
+		}
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return observations[ranked[i]].latency < observations[ranked[j]].latency
+	})
+	return ranked
+}
+
+// 按域名配置顺序，从最快的未占用候选开始选择。
+// 未达到延迟改善阈值的域名保留原记录，并保留其 IP 的占用关系。
+func (g *CloudflareDNSGroup) updateRanked(ctx context.Context, ranked []string, observations map[string]ddnsHealth, threshold time.Duration) {
+	if !g.Enabled() {
+		return
+	}
+	if threshold < 0 {
+		threshold = 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	occupied := make(map[string]int)
+	for _, updater := range g.updaters {
+		if ip := updater.currentIP(); ip != "" {
+			occupied[ip]++
+		}
+	}
+	for _, updater := range g.updaters {
+		if ctx.Err() != nil {
+			return
+		}
+		oldIP := updater.currentIP()
+		oldObs, measured := observations[oldIP]
+		// 其它协程可能刚完成故障切换，未测量的新旧基准留待下一轮。
+		if oldIP != "" && (!measured || (!oldObs.known && g.health[oldIP].failures < 2)) {
+			auditLogf("DDNS 保留 %s -> %s：本轮无可比较延迟或尚未连续失败两轮", updater.recordName, oldIP)
+			continue
+		}
+		chosen := ""
+		for _, ip := range ranked {
+			if ip == oldIP || occupied[ip] > 0 || !observations[ip].known {
+				continue
+			}
+			if oldIP != "" && oldObs.known && oldObs.latency-observations[ip].latency <= threshold {
+				continue
+			}
+			chosen = ip
+			break
+		}
+		if chosen == "" {
+			auditLogf("DDNS 保留 %s -> %s：没有未占用且改善超过 %d ms 的候选 IP", updater.recordName, oldIP, threshold.Milliseconds())
+			continue
+		}
+		if err := updater.UpdateIfChanged(chosen); err != nil {
+			auditLogf("DDNS 更新 %s 失败，保留原分配并等待下轮重试: %v", updater.recordName, err)
+			continue
+		}
+		if oldIP != "" {
+			occupied[oldIP]--
+		}
+		occupied[chosen]++
+		if oldIP != "" && oldObs.known {
+			auditLogf("DDNS 延迟优化 %s: %s -> %s，%d ms -> %d ms，改善 %d ms，阈值 %d ms", updater.recordName, oldIP, chosen, oldObs.latency.Milliseconds(), observations[chosen].latency.Milliseconds(), (oldObs.latency - observations[chosen].latency).Milliseconds(), threshold.Milliseconds())
+		} else {
+			auditLogf("DDNS 初始化或故障替换 %s: %s -> %s", updater.recordName, oldIP, chosen)
+		}
+	}
+}
+
+// refresh 为转发选路和 DDNS 共用同一轮测量结果。
+func (g *CloudflareDNSGroup) refresh(ctx context.Context, concurrency int, threshold time.Duration) ([]string, map[string]ddnsHealth) {
+	g.refreshMu.Lock()
+	defer g.refreshMu.Unlock()
+	ips := g.manager.GetIPAddresses()
+	probeList := append([]string(nil), ips...)
+	probeList = append(probeList, g.manager.GetCurrentIP())
+	for _, updater := range g.updaters {
+		probeList = append(probeList, updater.currentIP())
+	}
+	observations := g.probeIPs(ctx, probeList, concurrency)
+	if ctx.Err() != nil {
+		return nil, observations
+	}
+	g.applyHealth(observations)
+	ranked := rankAvailableIPs(ips, observations)
+	auditLogf("定时选路全量检测：候选 %d 个，本轮可用 %d 个，按延迟排序 %v", len(ips), len(ranked), ranked)
+	// 先处理已有候选，避免随机补充耗时阻塞本轮域名更新。
+	g.updateRanked(ctx, ranked, observations, threshold)
+	if len(ranked) < 10 && g.rescan != nil {
+		auditLogf("本轮可用 IP 为 %d 个，少于 10 个，启动随机筛选补充，目标候选数 %d", len(ranked), g.candidateLimit)
+		fresh := g.rescan(ctx)
+		if ctx.Err() != nil {
+			return nil, observations
+		}
+		seen := make(map[string]bool)
+		for _, ip := range ips {
+			seen[ip] = true
+		}
+		var added, unmeasured []string
+		for _, ip := range fresh {
+			if ip == "" || seen[ip] {
+				continue
+			}
+			seen[ip] = true
+			added = append(added, ip)
+			if _, ok := observations[ip]; !ok {
+				unmeasured = append(unmeasured, ip)
+			}
+		}
+		newObservations := g.probeIPs(ctx, unmeasured, concurrency)
+		if ctx.Err() != nil {
+			return nil, observations
+		}
+		// 已测量项在同一轮中不能被重复计为两次失败。
+		g.applyHealth(newObservations)
+		for ip, obs := range newObservations {
+			observations[ip] = obs
+		}
+		ips = append(ips, added...)
+		ranked = rankAvailableIPs(ips, observations)
+		auditLogf("随机补充完成：本轮可用 %d 个，按延迟排序 %v", len(ranked), ranked)
+		g.updateRanked(ctx, ranked, observations, threshold)
+	}
+	// 保留速度最快的候选，空位保留暂时失败项以便下轮复测，防止列表无限增长。
+	ordered := append([]string(nil), ranked...)
+	seen := make(map[string]bool)
+	for _, ip := range ordered {
+		seen[ip] = true
+	}
+	for _, ip := range ips {
+		if !seen[ip] {
+			ordered = append(ordered, ip)
+			seen[ip] = true
+		}
+	}
+	if g.candidateLimit > 0 && len(ordered) > g.candidateLimit {
+		ordered = ordered[:g.candidateLimit]
+	}
+	g.manager.ReplaceCandidates(ordered)
+	// 只保留下轮仍会检测的健康状态，避免反复补充后持续占用内存。
+	retained := make(map[string]bool)
+	for _, ip := range g.manager.GetIPAddresses() {
+		retained[ip] = true
+	}
+	retained[g.manager.GetCurrentIP()] = true
+	for _, updater := range g.updaters {
+		retained[updater.currentIP()] = true
+	}
+	for ip := range g.health {
+		if !retained[ip] {
+			delete(g.health, ip)
+		}
+	}
+	return ranked, observations
+}
+
+// 关闭定时选路时，多域名仍每 60 秒刷新一次。
+func (g *CloudflareDNSGroup) run(ctx context.Context, interval time.Duration, concurrency int, threshold time.Duration) {
+	if !g.Enabled() || !g.multi {
+		return
+	}
+	if interval > 0 {
+		<-ctx.Done()
+		return
+	}
+	g.refresh(ctx, concurrency, threshold)
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done(): return
-		case <-ticker.C: g.refresh(ctx)
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			g.refresh(ctx, concurrency, threshold)
 		}
 	}
 }
@@ -774,7 +941,7 @@ func main() {
 	domain := flag.String("domain", "cloudflaremirrors.com/debian", "响应状态码检查的域名地址")
 	ipCount := flag.Int("ipnum", 20, "提取的有效IP数量")
 	ipsType := flag.String("ips", "4", "指定生成IPv4还是IPv6地址 (4或6)")
-	num := flag.Int("num", 5, "定时选路时并发尝试的候选目标 IP 数量")
+	num := flag.Int("num", 5, "定时选路检测全部候选 IP 时的最大并发数")
 	routeInterval := flag.Int("route-interval", 60, "主动筛选最佳 IP 的间隔秒数；小于等于 0 表示关闭定时选路")
 	routeThreshold := flag.Int("route-threshold", 50, "定时选路切换阈值毫秒；新 IP 比当前 IP 快超过该值才切换")
 	port := flag.Int("port", 443, "转发的目标端口")
@@ -786,7 +953,7 @@ func main() {
 	cfZoneID := flag.String("cf-zone-id", os.Getenv("CLOUDFLARE_ZONE_ID"), "Cloudflare Zone ID，也可用环境变量 CLOUDFLARE_ZONE_ID")
 	cfRecordID := flag.String("cf-record-id", os.Getenv("CLOUDFLARE_RECORD_ID"), "Cloudflare DNS Record ID，可选；为空时按记录名自动查询，也可用环境变量 CLOUDFLARE_RECORD_ID")
 	cfRecordName := flag.String("cf-record-name", "cf.48521.xyz", "需要更新的 Cloudflare AAAA 记录名")
-	cfRecordNames := flag.String("cf-record-names", "", "多个 AAAA 域名，用逗号分隔，依次对应候选列表前 N 个 IP；优先于 cf-record-name")
+	cfRecordNames := flag.String("cf-record-names", "", "多个 AAAA 域名，用逗号分隔，按配置顺序选择满足延迟改善阈值的未占用 IP；优先于 cf-record-name")
 	cfRecordIDs := flag.String("cf-record-ids", "", "可选：与 cf-record-names 顺序对应的记录 ID，逗号分隔，空项自动查询")
 	cfProxied := flag.Bool("cf-proxied", false, "Cloudflare DNS 记录是否开启代理")
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
@@ -795,6 +962,10 @@ func main() {
 	daemonMode := flag.Bool("d", false, "后台运行模式；父进程启动后台子进程后退出")
 
 	flag.Parse()
+
+	if *ipCount <= 0 || *maxThreads <= 0 {
+		log.Fatal("ipnum 和 task 必须大于 0")
+	}
 
 	if *daemonMode && os.Getenv("CFNAT_DAEMONIZED") != "1" {
 		pid, err := daemonize(*logFile, *debugLog)
@@ -816,9 +987,13 @@ func main() {
 
 	ipManager := NewIPManager()
 	cfUpdater, err := newCloudflareDNSGroup(*cfEnable, *cfToken, *cfZoneID, *cfRecordID, *cfRecordName, *cfRecordNames, *cfRecordIDs, *cfProxied, *cfTTL, ipManager)
-	if err != nil { log.Fatalf("Cloudflare DDNS 配置错误: %v", err) }
+	if err != nil {
+		log.Fatalf("Cloudflare DDNS 配置错误: %v", err)
+	}
 	if cfUpdater.Enabled() {
-		if *ipsType != "6" { log.Fatal("Cloudflare AAAA 更新需要 -ips 6") }
+		if *ipsType != "6" {
+			log.Fatal("Cloudflare AAAA 更新需要 -ips 6")
+		}
 		for i, updater := range cfUpdater.updaters {
 			auditLogf("Cloudflare AAAA 自动更新已启用：域名[%d]=%s，多域名候选映射=%v", i+1, updater.recordName, cfUpdater.multi)
 		}
@@ -901,34 +1076,26 @@ func main() {
 			}
 		}
 
-		results := scanIPs(ipList, locationMap, *maxThreads)
+		var nextBatch func() []string
+		if *random {
+			nextBatch = func() []string {
+				if *ipsType == "6" {
+					return getRandomIPv6s(parseIPList(content))
+				}
+				return getRandomIPv4s(parseIPList(content))
+			}
+		}
+		collect := func(pool []string) []result {
+			return collectCandidateIPs(context.Background(), pool, nextBatch, func(batch []string) []result {
+				return scanIPs(context.Background(), batch, locationMap, *maxThreads)
+			}, *ipCount, *coloFilter)
+		}
+		results := collect(ipList)
 
 		if len(results) == 0 {
 			fmt.Println("未发现有效IP")
 			time.Sleep(3 * time.Second)
 			continue
-		}
-
-		if *coloFilter != "" {
-			filters := strings.Split(*coloFilter, ",")
-			var filteredResults []result
-			for _, r := range results {
-				for _, filter := range filters {
-					if strings.EqualFold(r.dataCenter, strings.TrimSpace(filter)) {
-						filteredResults = append(filteredResults, r)
-						break
-					}
-				}
-			}
-			results = filteredResults
-		}
-
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].tcpDuration < results[j].tcpDuration
-		})
-
-		if len(results) > *ipCount {
-			results = results[:*ipCount]
 		}
 
 		fmt.Println("IP 地址 | 数据中心 | 地区 | 城市 | 延迟")
@@ -944,33 +1111,31 @@ func main() {
 		}
 		ipManager.SetIPAddresses(ips)
 		cfUpdater.health = make(map[string]ddnsHealth)
-		cfUpdater.ranked = nil
-		cfUpdater.lastScan = time.Time{}
+		cfUpdater.candidateLimit = max(*ipCount, 10)
 		cfUpdater.probe = func(ip string) (time.Duration, bool) {
 			elapsed, ok := measureIPDelay(ip, *port, time.Duration(*Delay)*time.Millisecond)
-			if !ok { return elapsed, false }
+			if !ok || elapsed > time.Duration(*Delay)*time.Millisecond {
+				return elapsed, false
+			}
 			return elapsed, checkValidIP(ip, *port, *useTLS, *domain, *code)
 		}
-		cfUpdater.rescan = func() []string {
-			pool := ipList
-			if *random {
-				if *ipsType == "6" { pool = getRandomIPv6s(parseIPList(content)) } else { pool = getRandomIPv4s(parseIPList(content)) }
-			}
-			fresh := scanIPs(pool, locationMap, *maxThreads)
-			sort.SliceStable(fresh, func(i,j int) bool { return fresh[i].tcpDuration < fresh[j].tcpDuration })
-			var replenished []string
-			for _, r := range fresh {
-				if *coloFilter != "" {
-					matched := false
-					for _, colo := range strings.Split(*coloFilter, ",") { if strings.EqualFold(strings.TrimSpace(colo), r.dataCenter) { matched = true; break } }
-					if !matched { continue }
+		cfUpdater.rescan = func(ctx context.Context) []string {
+			// 候选不足时始终随机抽样，包括启动时使用 -random=false 的情况。
+			generate := func() []string {
+				if *ipsType == "6" {
+					return getRandomIPv6s(parseIPList(content))
 				}
+				return getRandomIPv4s(parseIPList(content))
+			}
+			fresh := collectCandidateIPs(ctx, generate(), generate, func(batch []string) []result {
+				return scanIPs(ctx, batch, locationMap, *maxThreads)
+			}, cfUpdater.candidateLimit, *coloFilter)
+			replenished := make([]string, 0, len(fresh))
+			for _, r := range fresh {
 				replenished = append(replenished, r.ip)
-				if len(replenished) >= *ipCount { break }
 			}
 			return replenished
 		}
-
 
 		currentIP, currentIndex := selectValidIP(ipManager, *useTLS, *port, *domain, *code)
 		if currentIP == "" {
@@ -992,7 +1157,7 @@ func main() {
 		loopWG.Add(4)
 		go func() {
 			defer loopWG.Done()
-			cfUpdater.run(ctx, time.Duration(*routeInterval)*time.Second)
+			cfUpdater.run(ctx, time.Duration(*routeInterval)*time.Second, *num, time.Duration(*routeThreshold)*time.Millisecond)
 		}()
 
 		go func() {
@@ -1108,8 +1273,72 @@ func loadLocations() ([]location, error) {
 	return locations, nil
 }
 
+// collectCandidateIPs 按轮次累积通过机房过滤的不同 IP，达到目标数量后按延迟排序。
+// 随机模式持续补充；固定列表用尽时返回实际数量。
+func collectCandidateIPs(ctx context.Context, pool []string, nextBatch func() []string, scan func([]string) []result, target int, coloFilter string) []result {
+	if target <= 0 {
+		return nil
+	}
+	var results []result
+	seen := make(map[string]struct{})
+	filters := strings.Split(coloFilter, ",")
+	for round := 1; ctx.Err() == nil; round++ {
+		batch := make([]string, 0, len(pool))
+		batchSeen := make(map[string]struct{}, len(pool))
+		for _, ip := range pool {
+			if _, ok := seen[ip]; ok {
+				continue
+			}
+			if _, ok := batchSeen[ip]; ok {
+				continue
+			}
+			batchSeen[ip] = struct{}{}
+			batch = append(batch, ip)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, r := range scan(batch) {
+			if coloFilter != "" {
+				matched := false
+				for _, filter := range filters {
+					if strings.EqualFold(r.dataCenter, strings.TrimSpace(filter)) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			if _, ok := seen[r.ip]; ok {
+				continue
+			}
+			seen[r.ip] = struct{}{}
+			results = append(results, r)
+		}
+		fmt.Printf("第 %d 轮初筛完成：已累计 %d 个候选 IP，目标 %d 个\n", round, len(results), target)
+		if len(results) >= target || nextBatch == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(3 * time.Second):
+		}
+		pool = nextBatch()
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].tcpDuration < results[j].tcpDuration
+	})
+	if len(results) > target {
+		results = results[:target]
+	}
+	return results
+}
+
 // scanIPs 扫描 IP 列表并返回结果
-func scanIPs(ipList []string, locationMap map[string]location, maxThreads int) []result {
+func scanIPs(ctx context.Context, ipList []string, locationMap map[string]location, maxThreads int) []result {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var results []result
@@ -1119,9 +1348,17 @@ func scanIPs(ipList []string, locationMap map[string]location, maxThreads int) [
 	var count int32
 	total := len(ipList)
 
+scanLoop:
 	for _, ip := range ipList {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break scanLoop
+		case thread <- struct{}{}:
+		}
 		wg.Add(1)
-		thread <- struct{}{}
 		go func(ipAddr string) {
 			defer func() {
 				<-thread
@@ -1139,7 +1376,7 @@ func scanIPs(ipList []string, locationMap map[string]location, maxThreads int) [
 				KeepAlive: 0,
 			}
 			start := time.Now()
-			conn, err := dialer.Dial("tcp", net.JoinHostPort(ipAddr, "80"))
+			conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ipAddr, "80"))
 			if err != nil {
 				return
 			}
@@ -1338,8 +1575,8 @@ func randomIPv6InPrefix(prefix netip.Prefix) string {
 	return netip.AddrFrom16(ipBytes).String()
 }
 
-// 如果掩码 < 52，则从每个 /52 中随机提取一个 IPv6
-// 如果掩码 >= 52，则从当前 CIDR 中随机提取一个 IPv6
+// 如果掩码 < 55，则从每个 /55 中随机提取一个 IPv6（每个 /48 共 128 个）
+// 如果掩码 >= 55，则从当前 CIDR 中随机提取一个 IPv6
 func getRandomIPv6s(ipList []string) []string {
 	var randomIPs []string
 
@@ -1361,12 +1598,12 @@ func getRandomIPv6s(ipList []string) []string {
 		prefix = prefix.Masked()
 		bits := prefix.Bits()
 
-		if bits < 52 {
-			count := uint64(1) << uint(52-bits)
+		if bits < 55 {
+			count := uint64(1) << uint(55-bits)
 
 			for i := uint64(0); i < count; i++ {
-				p52 := makeSubPrefix(prefix, 52, i)
-				randomIPs = append(randomIPs, randomIPv6InPrefix(p52))
+				p55 := makeSubPrefix(prefix, 55, i)
+				randomIPs = append(randomIPs, randomIPv6InPrefix(p55))
 			}
 		} else {
 			randomIPs = append(randomIPs, randomIPv6InPrefix(prefix))
@@ -1627,131 +1864,48 @@ func selectFastestIPByDial(ips []string, port int, delay time.Duration) (string,
 	return bestIP, bestDelay, true
 }
 
-// periodicRouteSelector 每隔固定时间主动从候选 IP 中选出 TCP 建连最快的 IP。
-// 只有新 IP 比当前 currentIP 快超过 routeThreshold 时才切换；如果当前 IP 无法连接，则忽略阈值直接切换。
+// periodicRouteSelector 全量检测候选，共用测量结果进行 DDNS 优化和转发选路。
 func periodicRouteSelector(ctx context.Context, interval time.Duration, num int, port int, delay time.Duration, routeThreshold time.Duration, ipManager *IPManager, cfUpdater *CloudflareDNSGroup) {
 	if interval <= 0 {
 		auditLogln("定时选路已关闭")
 		<-ctx.Done()
 		return
 	}
-
 	if routeThreshold < 0 {
 		routeThreshold = 0
 	}
-
 	runSelect := func(reason string) {
-		cfUpdater.refresh(ctx)
-		if ctx.Err() != nil { return }
-		candidates := ipManager.GetCandidateIPs(num)
+		auditLogf("定时选路开始：原因=%s，并发数=%d，目标端口=%d，有效延迟=%d ms，优化阈值=%d ms", reason, num, port, delay.Milliseconds(), routeThreshold.Milliseconds())
+		ranked, observations := cfUpdater.refresh(ctx, num, routeThreshold)
+		if ctx.Err() != nil || len(ranked) == 0 {
+			return
+		}
 		currentIP := ipManager.GetCurrentIP()
-
-		auditLogf(
-			"定时选路开始：原因=%s，候选数=%d，currentIP=%s，连接超时=%d ms，切换阈值=%d ms",
-			reason,
-			len(candidates),
-			currentIP,
-			delay.Milliseconds(),
-			routeThreshold.Milliseconds(),
-		)
-
-		if len(candidates) == 0 {
-			auditLogln("定时选路结束：没有候选 IP")
+		current, measured := observations[currentIP]
+		if currentIP != "" && !measured {
 			return
 		}
-
-		bestIP, bestDelay, ok := selectFastestIPByDial(candidates, port, delay)
-		if !ok {
-			auditLogf("定时选路失败：%d 个候选 IP 均无法在 %d ms 内连接", len(candidates), delay.Milliseconds())
-			return
-		}
-
-		if currentIP == "" {
-			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
-			if !found {
-				auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
-				return
-			}
-			if changed {
-				auditLogf("定时选路设置当前 IP: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
-				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-					auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
-				}
-			} else {
-				auditLogf("定时选路结束：currentIP 为空但 SetCurrentIP 未发生变化，bestIP=%s", bestIP)
-			}
-			return
-		}
-
-		currentDelay, currentOK := measureIPDelay(currentIP, port, delay)
-		if !currentOK {
-			if bestIP == currentIP {
-				auditLogf("定时选路结束：当前 IP %s 检测失败，但最快候选仍是当前 IP，保持不变", currentIP)
-				return
-			}
-
-			changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
-			if !found {
-				auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
-				return
-			}
-
-			if changed {
-				auditLogf("定时选路检测到当前 IP 不可用，切换到: %s 延迟 %d ms 索引 %d", bestIP, bestDelay.Milliseconds(), index)
-				if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-					auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
-				}
-			} else {
-				auditLogf("定时选路结束：当前 IP 不可用，但目标 IP 未变化: %s", bestIP)
-			}
-			return
-		}
-
+		bestIP := ranked[0]
+		best := observations[bestIP]
 		if bestIP == currentIP {
-			auditLogf("定时选路完成：保持当前 IP %s，当前延迟 %d ms，最快候选延迟 %d ms", currentIP, currentDelay.Milliseconds(), bestDelay.Milliseconds())
 			return
 		}
-
-		improvement := currentDelay - bestDelay
-		if improvement <= routeThreshold {
-			auditLogf(
-				"定时选路完成：保持当前 IP %s，新候选 %s，当前延迟 %d ms，新延迟 %d ms，改善 %d ms，未超过阈值 %d ms",
-				currentIP,
-				bestIP,
-				currentDelay.Milliseconds(),
-				bestDelay.Milliseconds(),
-				improvement.Milliseconds(),
-				routeThreshold.Milliseconds(),
-			)
+		if currentIP != "" && current.known && current.latency-best.latency <= routeThreshold {
+			auditLogf("定时选路保持当前 IP %s：最佳候选 %s 改善 %d ms，未超过阈值 %d ms", currentIP, bestIP, (current.latency - best.latency).Milliseconds(), routeThreshold.Milliseconds())
 			return
 		}
-
 		changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
-		if !found {
-			auditLogf("定时选路选出的 IP 不在候选列表中: %s", bestIP)
-			return
+		if found && changed {
+			auditLogf("定时选路更新转发 IP: %s -> %s，延迟 %d ms，索引 %d", currentIP, bestIP, best.latency.Milliseconds(), index)
 		}
-
-		if changed {
-			auditLogf("定时选路更新当前 IP: %s -> %s，延迟 %d ms -> %d ms，改善 %d ms，超过阈值 %d ms，索引 %d", currentIP, bestIP, currentDelay.Milliseconds(), bestDelay.Milliseconds(), improvement.Milliseconds(), routeThreshold.Milliseconds(), index)
-			if err := cfUpdater.UpdateIfChanged(bestIP); err != nil {
-				auditLogf("更新 Cloudflare AAAA 记录失败: %v", err)
-			}
-		} else {
-			auditLogf("定时选路完成：目标 IP 与当前记录一致，保持 %s", bestIP)
-		}
+		// DDNS 已由 refresh 按每个域名自己的延迟基准更新，不能再用转发 IP 覆盖。
 	}
-
-	// 启动后立即选一次，后续每 interval 选一次。
 	runSelect("startup")
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			auditLogln("定时选路收到退出信号")
 			return
 		case <-ticker.C:
 			runSelect("interval")
