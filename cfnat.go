@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -55,13 +56,187 @@ type RuntimeLogger struct {
 	logger *log.Logger
 }
 
-func initRuntimeLogger(logFilePath string, debug bool) (*os.File, error) {
+const logRetention = 24 * time.Hour
+
+// retainedLogWriter 串行处理写入和清理，所有日志入口共用同一文件句柄。
+type retainedLogWriter struct {
+	mu           sync.Mutex
+	file         *os.File
+	path         string
+	untimedSince time.Time
+	stop         chan struct{}
+	done         chan struct{}
+	closeOnce    sync.Once
+	closeErr     error
+	closed       bool
+}
+
+func newRetainedLogWriter(path string) (*retainedLogWriter, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	w := &retainedLogWriter{file: file, path: path, untimedSince: info.ModTime(), stop: make(chan struct{}), done: make(chan struct{})}
+	if err := w.prune(time.Now()); err != nil {
+		file.Close()
+		return nil, err
+	}
+	go func() {
+		defer close(w.done)
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-w.stop:
+				return
+			case now := <-ticker.C:
+				if err := w.prune(now); err != nil {
+					auditLogf("清理超过 24 小时的日志失败: %v", err)
+				}
+			}
+		}
+	}()
+	return w, nil
+}
+
+func (w *retainedLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	return w.file.Write(p)
+}
+
+// 根据每条日志的时间戳清理；多行日志的续行沿用上一条记录的时间。
+// 新文件写入成功后才替换原文件，清理出错时保留原日志。
+func (w *retainedLogWriter) prune(now time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	input, err := os.Open(w.path)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(w.path), ".cfnat-log-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer tmp.Close()
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+	reader := bufio.NewReader(input)
+	writer := bufio.NewWriter(tmp)
+	cutoff := now.Truncate(time.Second).Add(-logRetention)
+	keep := !w.untimedSince.Before(cutoff)
+	sawTimestamp, changed := false, false
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			if len(line) >= 19 {
+				if stamp, err := time.ParseInLocation("2006/01/02 15:04:05", line[:19], time.Local); err == nil {
+					keep = !stamp.Before(cutoff)
+					sawTimestamp = true
+				}
+			}
+			if keep {
+				if !sawTimestamp {
+					// 兼容旧版 debug 中未带时间的输出，只在迁移时使用旧文件修改时间。
+					line = w.untimedSince.Format("2006/01/02 15:04:05") + " " + line
+					changed = true
+				}
+				if _, err := writer.WriteString(line); err != nil {
+					return err
+				}
+			} else {
+				changed = true
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	// 新句柄也用 O_APPEND，后续日志始终追加到保留下来的内容之后。
+	appendFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, w.path); err != nil {
+		appendFile.Close()
+		return err
+	}
+	oldFile := w.file
+	w.file = appendFile
+	oldFile.Close()
+	return nil
+}
+
+func (w *retainedLogWriter) Close() error {
+	w.closeOnce.Do(func() {
+		close(w.stop)
+		<-w.done
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.closed = true
+		w.closeErr = w.file.Close()
+	})
+	return w.closeErr
+}
+
+// 后台 debug 的控制台输出也加上时间戳并通过统一 writer 写入。
+func consolePrintf(format string, args ...interface{}) {
+	if runtimeLogger != nil && runtimeLogger.debug && os.Getenv("CFNAT_DAEMONIZED") == "1" {
+		runtimeLogger.logger.Printf(format, args...)
+		return
+	}
+	fmt.Printf(format, args...)
+}
+
+func consolePrintln(args ...interface{}) {
+	if runtimeLogger != nil && runtimeLogger.debug && os.Getenv("CFNAT_DAEMONIZED") == "1" {
+		runtimeLogger.logger.Println(args...)
+		return
+	}
+	fmt.Println(args...)
+}
+
+func initRuntimeLogger(logFilePath string, debug bool) (io.Closer, error) {
 	logFilePath = strings.TrimSpace(logFilePath)
 	if logFilePath == "" {
 		return nil, nil
 	}
 
-	file, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := newRetainedLogWriter(logFilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +247,7 @@ func initRuntimeLogger(logFilePath string, debug bool) (*os.File, error) {
 	}
 
 	if debug {
-		// 后台运行时，stderr 已经重定向到日志文件；这里直接写 file，避免重复写入。
+		// 后台标准输出指向空设备，所有文件日志均通过保留期限 writer 写入。
 		if os.Getenv("CFNAT_DAEMONIZED") == "1" {
 			log.SetOutput(file)
 		} else {
@@ -852,7 +1027,7 @@ func formatCloudflareErrors(errors []cloudflareAPIError) string {
 	return strings.Join(parts, "; ")
 }
 
-func daemonize(logFilePath string, debug bool) (int, error) {
+func daemonize() (int, error) {
 	exePath, err := os.Executable()
 	if err != nil {
 		return 0, fmt.Errorf("获取当前可执行文件路径失败: %w", err)
@@ -869,52 +1044,18 @@ func daemonize(logFilePath string, debug bool) (int, error) {
 	}
 	defer stdinFile.Close()
 
-	openNullWriter := func() (*os.File, error) {
-		return os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	// 子进程通过日志 writer 管理文件，禁止 stdout/stderr 绕过清理锁直接写文件。
+	outputFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return 0, fmt.Errorf("打开后台输出重定向失败: %w", err)
 	}
-
-	openLogWriter := func() (*os.File, error) {
-		if strings.TrimSpace(logFilePath) == "" {
-			return openNullWriter()
-		}
-		return os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	}
-
-	var stdoutFile *os.File
-	var stderrFile *os.File
-
-	if debug {
-		stdoutFile, err = openLogWriter()
-		if err != nil {
-			return 0, fmt.Errorf("打开 stdout 日志文件失败: %w", err)
-		}
-		defer stdoutFile.Close()
-
-		stderrFile, err = openLogWriter()
-		if err != nil {
-			return 0, fmt.Errorf("打开 stderr 日志文件失败: %w", err)
-		}
-		defer stderrFile.Close()
-	} else {
-		// 非 debug 后台模式只通过 auditLog 写关键日志到 log-file，普通 stdout/stderr 丢弃，避免刷日志。
-		stdoutFile, err = openNullWriter()
-		if err != nil {
-			return 0, fmt.Errorf("打开 stdout 重定向失败: %w", err)
-		}
-		defer stdoutFile.Close()
-
-		stderrFile, err = openNullWriter()
-		if err != nil {
-			return 0, fmt.Errorf("打开 stderr 重定向失败: %w", err)
-		}
-		defer stderrFile.Close()
-	}
+	defer outputFile.Close()
 
 	env := append(os.Environ(), "CFNAT_DAEMONIZED=1")
 	attr := &os.ProcAttr{
 		Dir:   workDir,
 		Env:   env,
-		Files: []*os.File{stdinFile, stdoutFile, stderrFile},
+		Files: []*os.File{stdinFile, outputFile, outputFile},
 		Sys: &syscall.SysProcAttr{
 			Setsid: true,
 		},
@@ -957,7 +1098,7 @@ func main() {
 	cfRecordIDs := flag.String("cf-record-ids", "", "可选：与 cf-record-names 顺序对应的记录 ID，逗号分隔，空项自动查询")
 	cfProxied := flag.Bool("cf-proxied", false, "Cloudflare DNS 记录是否开启代理")
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
-	logFile := flag.String("log-file", "cfnat.log", "日志文件路径；为空表示不写日志文件")
+	logFile := flag.String("log-file", "cfnat.log", "日志文件路径，自动保留最近 24 小时；为空表示不写日志文件")
 	debugLog := flag.Bool("debug", false, "debug 模式：将全部 log 输出同时写入日志文件")
 	daemonMode := flag.Bool("d", false, "后台运行模式；父进程启动后台子进程后退出")
 
@@ -968,11 +1109,11 @@ func main() {
 	}
 
 	if *daemonMode && os.Getenv("CFNAT_DAEMONIZED") != "1" {
-		pid, err := daemonize(*logFile, *debugLog)
+		pid, err := daemonize()
 		if err != nil {
 			log.Fatalf("后台运行启动失败: %v", err)
 		}
-		fmt.Printf("已后台运行，PID: %d，日志文件: %s\n", pid, *logFile)
+		consolePrintf("已后台运行，PID: %d，日志文件: %s\n", pid, *logFile)
 		return
 	}
 
@@ -982,7 +1123,7 @@ func main() {
 	}
 	if logHandle != nil {
 		defer logHandle.Close()
-		auditLogf("日志文件已启用: %s，debug=%v，daemon=%v", *logFile, *debugLog, os.Getenv("CFNAT_DAEMONIZED") == "1")
+		auditLogf("日志文件已启用: %s，保留最近 24 小时，每 10 分钟清理，debug=%v，daemon=%v", *logFile, *debugLog, os.Getenv("CFNAT_DAEMONIZED") == "1")
 	}
 
 	ipManager := NewIPManager()
@@ -1033,28 +1174,28 @@ func main() {
 			filename = "ips-v4.txt"
 			url = "https://www.baipiao.eu.org/cloudflare/ips-v4"
 		default:
-			fmt.Println("无效的IP类型。请使用 '4' 或 '6'")
+			consolePrintln("无效的IP类型。请使用 '4' 或 '6'")
 			return
 		}
 
 		var content string
 
 		if _, err = os.Stat(filename); os.IsNotExist(err) {
-			fmt.Printf("文件 %s 不存在，正在从 URL %s 下载数据\n", filename, url)
+			consolePrintf("文件 %s 不存在，正在从 URL %s 下载数据\n", filename, url)
 			content, err = getURLContent(url)
 			if err != nil {
-				fmt.Println("获取URL内容出错:", err)
+				consolePrintln("获取URL内容出错:", err)
 				return
 			}
 			err = saveToFile(filename, content)
 			if err != nil {
-				fmt.Println("保存文件出错:", err)
+				consolePrintln("保存文件出错:", err)
 				return
 			}
 		} else {
 			content, err = getFileContent(filename)
 			if err != nil {
-				fmt.Println("读取本地文件出错:", err)
+				consolePrintln("读取本地文件出错:", err)
 				return
 			}
 		}
@@ -1071,7 +1212,7 @@ func main() {
 		} else {
 			ipList, err = readIPs(filename)
 			if err != nil {
-				fmt.Println("读取IP出错:", err)
+				consolePrintln("读取IP出错:", err)
 				return
 			}
 		}
@@ -1093,17 +1234,17 @@ func main() {
 		results := collect(ipList)
 
 		if len(results) == 0 {
-			fmt.Println("未发现有效IP")
+			consolePrintln("未发现有效IP")
 			time.Sleep(3 * time.Second)
 			continue
 		}
 
-		fmt.Println("IP 地址 | 数据中心 | 地区 | 城市 | 延迟")
+		consolePrintln("IP 地址 | 数据中心 | 地区 | 城市 | 延迟")
 		for _, r := range results {
-			fmt.Printf("%s | %s | %s | %s | %s\n", r.ip, r.dataCenter, r.region, r.city, r.latency)
+			consolePrintf("%s | %s | %s | %s | %s\n", r.ip, r.dataCenter, r.region, r.city, r.latency)
 		}
 
-		fmt.Printf("成功提取 %d 个有效IP，耗时 %d秒\n", len(results), time.Since(startTime)/time.Second)
+		consolePrintf("成功提取 %d 个有效IP，耗时 %d秒\n", len(results), time.Since(startTime)/time.Second)
 
 		var ips []string
 		for _, r := range results {
@@ -1225,7 +1366,7 @@ func loadLocations() ([]location, error) {
 	var locations []location
 
 	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
-		fmt.Println("本地 locations.json 不存在\n正在从 https://www.baipiao.eu.org/cloudflare/locations 下载 locations.json")
+		consolePrintln("本地 locations.json 不存在\n正在从 https://www.baipiao.eu.org/cloudflare/locations 下载 locations.json")
 		resp, err := http.Get("https://www.baipiao.eu.org/cloudflare/locations")
 		if err != nil {
 			return nil, fmt.Errorf("无法从URL中获取JSON: %v", err)
@@ -1317,7 +1458,7 @@ func collectCandidateIPs(ctx context.Context, pool []string, nextBatch func() []
 			seen[r.ip] = struct{}{}
 			results = append(results, r)
 		}
-		fmt.Printf("第 %d 轮初筛完成：已累计 %d 个候选 IP，目标 %d 个\n", round, len(results), target)
+		consolePrintf("第 %d 轮初筛完成：已累计 %d 个候选 IP，目标 %d 个\n", round, len(results), target)
 		if len(results) >= target || nextBatch == nil {
 			break
 		}
@@ -1365,9 +1506,9 @@ scanLoop:
 				wg.Done()
 				current := atomic.AddInt32(&count, 1)
 				percentage := float64(current) / float64(total) * 100
-				fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\r", current, total, percentage)
+				consolePrintf("已完成: %d 总数: %d 已完成: %.2f%%\r", current, total, percentage)
 				if int(current) == total {
-					fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\n", current, total, percentage)
+					consolePrintf("已完成: %d 总数: %d 已完成: %.2f%%\n", current, total, percentage)
 				}
 			}()
 
@@ -1423,10 +1564,10 @@ scanLoop:
 			loc, ok := locationMap[dataCenter]
 			mu.Lock()
 			if ok {
-				fmt.Printf("发现有效IP %s 位置信息 %s 延迟 %d 毫秒\n", ipAddr, loc.City, tcpDuration.Milliseconds())
+				consolePrintf("发现有效IP %s 位置信息 %s 延迟 %d 毫秒\n", ipAddr, loc.City, tcpDuration.Milliseconds())
 				results = append(results, result{ipAddr, dataCenter, loc.Region, loc.City, fmt.Sprintf("%d ms", tcpDuration.Milliseconds()), tcpDuration})
 			} else {
-				fmt.Printf("发现有效IP %s 位置信息未知 延迟 %d 毫秒\n", ipAddr, tcpDuration.Milliseconds())
+				consolePrintf("发现有效IP %s 位置信息未知 延迟 %d 毫秒\n", ipAddr, tcpDuration.Milliseconds())
 				results = append(results, result{ipAddr, dataCenter, "", "", fmt.Sprintf("%d ms", tcpDuration.Milliseconds()), tcpDuration})
 			}
 			mu.Unlock()
