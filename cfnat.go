@@ -31,11 +31,10 @@ const (
 )
 
 var (
-	activeConnections  int32 // 用于跟踪活跃连接的数量
-	validIPClientCache sync.Map
-	randomMu           sync.Mutex
-	randomGenerator    = rand.New(rand.NewSource(time.Now().UnixNano()))
-	runtimeLogger      *RuntimeLogger
+	activeConnections int32 // 用于跟踪活跃连接的数量
+	randomMu          sync.Mutex
+	randomGenerator   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	runtimeLogger     *RuntimeLogger
 )
 
 // IPManager 用于安全管理 IP 地址状态
@@ -457,6 +456,23 @@ func (m *IPManager) SetCurrentIPByValue(ip string) (bool, int, bool) {
 	return false, -1, false
 }
 
+// 只在测量期间当前 IP 未被别的协程改变时切换。
+func (m *IPManager) SetCurrentIPIfUnchanged(oldIP, newIP string) (bool, int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentIP != oldIP {
+		return false, -1, false
+	}
+	for i, ip := range m.ipAddresses {
+		if ip == newIP {
+			changed := oldIP != newIP
+			m.currentIP, m.currentIndex, m.allIPsChecked = newIP, i, false
+			return changed, i, true
+		}
+	}
+	return false, -1, false
+}
+
 func (m *IPManager) IsAllIPsChecked() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -488,9 +504,10 @@ func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, co
 		}
 
 		if checkValidIP(ip, port, useTLS, domain, code) {
-			_, index, found := m.SetCurrentIPByValue(ip)
+			_, index, found := m.SetCurrentIPIfUnchanged(currentIP, ip)
 			if !found {
-				continue
+				// 列表或当前 IP 已被另一协程修改，下一轮重新检查。
+				return m.GetCurrentIP() != ""
 			}
 			auditLogf("切换到新的有效 IP: %s 更新 IP 索引: %d", ip, index)
 			return true
@@ -498,6 +515,10 @@ func (m *IPManager) switchToNextValidIP(useTLS bool, port int, domain string, co
 	}
 
 	m.mu.Lock()
+	if m.currentIP != currentIP {
+		m.mu.Unlock()
+		return true
+	}
 	m.allIPsChecked = true
 	m.mu.Unlock()
 
@@ -524,16 +545,17 @@ type location struct {
 }
 
 type CloudflareDNSUpdater struct {
-	enabled    bool
-	token      string
-	zoneID     string
-	recordID   string
-	recordName string
-	proxied    bool
-	ttl        int
-	client     *http.Client
-	mu         sync.Mutex
-	lastIP     string
+	enabled      bool
+	token        string
+	zoneID       string
+	recordID     string
+	recordName   string
+	proxied      bool
+	ttl          int
+	client       *http.Client
+	mu           sync.Mutex
+	lastIP       string
+	recordLoaded bool
 }
 
 // CloudflareDNSGroup 为每个域名维护独立记录 ID 和更新缓存。
@@ -606,10 +628,64 @@ type ddnsHealth struct {
 	known    bool
 }
 
+// loadCurrentIP 从 Cloudflare 读取域名现有记录，避免重启后把未知旧 IP 当作空记录覆盖。
+func (u *CloudflareDNSUpdater) loadCurrentIP(ctx context.Context) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.loadCurrentIPLocked(ctx)
+}
+
+func (u *CloudflareDNSUpdater) loadCurrentIPLocked(ctx context.Context) error {
+	if u.recordLoaded {
+		return nil
+	}
+	if u.recordID == "" {
+		return u.findRecordIDLocked()
+	}
+	apiURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", u.zoneID, u.recordID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+u.token)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("读取 Cloudflare AAAA 记录 %s 失败: %w", u.recordName, err)
+	}
+	defer resp.Body.Close()
+	var payload cloudflareDNSRecordResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return fmt.Errorf("解析 Cloudflare AAAA 记录 %s 失败: %w", u.recordName, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !payload.Success {
+		return fmt.Errorf("读取 Cloudflare AAAA 记录 %s 失败，HTTP %d: %s", u.recordName, resp.StatusCode, formatCloudflareErrors(payload.Errors))
+	}
+	return u.setRecordContentLocked(payload.Result)
+}
+
+func (u *CloudflareDNSUpdater) setRecordContentLocked(record cloudflareDNSRecord) error {
+	if record.ID == "" || record.Type != "AAAA" || !strings.EqualFold(strings.TrimSuffix(record.Name, "."), u.recordName) || (record.ID != "" && record.ID != u.recordID) {
+		return fmt.Errorf("Cloudflare 记录 %s 的 ID、类型或域名不匹配", u.recordName)
+	}
+	addr, err := netip.ParseAddr(record.Content)
+	if err != nil || !addr.Is6() {
+		return fmt.Errorf("Cloudflare 记录 %s 的现有 IPv6 无效: %q", u.recordName, record.Content)
+	}
+	u.lastIP = addr.String()
+	u.recordLoaded = true
+	return nil
+}
+
 func (u *CloudflareDNSUpdater) currentIP() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.lastIP
+}
+
+func (u *CloudflareDNSUpdater) currentRecord() (string, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastIP, u.recordLoaded
 }
 
 // probeIPs 检测全部地址，concurrency 仅限制并发数，不限制检测范围。
@@ -705,7 +781,10 @@ func (g *CloudflareDNSGroup) updateRanked(ctx context.Context, ranked []string, 
 		if ctx.Err() != nil {
 			return
 		}
-		oldIP := updater.currentIP()
+		oldIP, loaded := updater.currentRecord()
+		if !loaded && oldIP == "" {
+			continue
+		}
 		oldObs, measured := observations[oldIP]
 		// 其它协程可能刚完成故障切换，未测量的新旧基准留待下一轮。
 		if oldIP != "" && (!measured || (!oldObs.known && g.health[oldIP].failures < 2)) {
@@ -751,6 +830,9 @@ func (g *CloudflareDNSGroup) refresh(ctx context.Context, concurrency int, thres
 	probeList := append([]string(nil), ips...)
 	probeList = append(probeList, g.manager.GetCurrentIP())
 	for _, updater := range g.updaters {
+		if err := updater.loadCurrentIP(ctx); err != nil {
+			auditLogf("读取 %s 的当前 AAAA 记录失败，本轮暂不更新该域名: %v", updater.recordName, err)
+		}
 		probeList = append(probeList, updater.currentIP())
 	}
 	observations := g.probeIPs(ctx, probeList, concurrency)
@@ -913,15 +995,12 @@ func (u *CloudflareDNSUpdater) UpdateIfChanged(ip string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	if err := u.loadCurrentIPLocked(context.Background()); err != nil {
+		return err
+	}
 	if u.lastIP == ip {
 		auditLogf("Cloudflare AAAA 记录未更新: %s 仍为 %s", u.recordName, ip)
 		return nil
-	}
-
-	if u.recordID == "" {
-		if err := u.findRecordIDLocked(); err != nil {
-			return err
-		}
 	}
 
 	payload := map[string]any{
@@ -968,6 +1047,7 @@ func (u *CloudflareDNSUpdater) UpdateIfChanged(ip string) error {
 	}
 
 	u.lastIP = ip
+	u.recordLoaded = true
 	auditLogf("Cloudflare AAAA 记录已更新: %s -> %s", u.recordName, ip)
 	return nil
 }
@@ -1011,6 +1091,9 @@ func (u *CloudflareDNSUpdater) findRecordIDLocked() error {
 		return fmt.Errorf("域名 %s 存在多个 AAAA 记录，请显式指定对应的记录 ID", u.recordName)
 	}
 	u.recordID = cfResp.Result[0].ID
+	if err := u.setRecordContentLocked(cfResp.Result[0]); err != nil {
+		return err
+	}
 	auditLogf("已找到 Cloudflare AAAA 记录 ID: %s (%s -> %s)", u.recordID, cfResp.Result[0].Name, cfResp.Result[0].Content)
 	return nil
 }
@@ -1356,7 +1439,6 @@ func main() {
 		loopWG.Wait()
 
 		ipManager.Clear()
-		validIPClientCache = sync.Map{}
 		log.Println("主函数将退出当前循环，因为所有 IP 都已用尽")
 	}
 }
@@ -1367,7 +1449,7 @@ func loadLocations() ([]location, error) {
 
 	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
 		consolePrintln("本地 locations.json 不存在\n正在从 https://www.baipiao.eu.org/cloudflare/locations 下载 locations.json")
-		resp, err := http.Get("https://www.baipiao.eu.org/cloudflare/locations")
+		resp, err := (&http.Client{Timeout: 15 * time.Second}).Get("https://www.baipiao.eu.org/cloudflare/locations")
 		if err != nil {
 			return nil, fmt.Errorf("无法从URL中获取JSON: %v", err)
 		}
@@ -1580,7 +1662,7 @@ scanLoop:
 
 // 获取URL内容
 func getURLContent(url string) (string, error) {
-	resp, err := http.Get(url)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -1638,21 +1720,30 @@ func nextRandomIntn(n int) int {
 	return randomGenerator.Intn(n)
 }
 
-// 从每个/24子网随机提取一个IPv4
+// 从每个 IPv4 CIDR 中随机提取一个地址，支持 /24 及其他掩码。
 func getRandomIPv4s(ipList []string) []string {
 	var randomIPs []string
 	for _, subnet := range ipList {
 		subnet = strings.TrimSpace(subnet)
-		if subnet == "" {
+		if !strings.Contains(subnet, "/") {
+			addr, err := netip.ParseAddr(subnet)
+			if err == nil && addr.Is4() {
+				subnet = netip.PrefixFrom(addr, 24).Masked().String()
+			}
+		}
+		prefix, err := netip.ParsePrefix(subnet)
+		if err != nil || !prefix.Addr().Is4() {
 			continue
 		}
-		baseIP := strings.TrimSuffix(subnet, "/24")
-		octets := strings.Split(baseIP, ".")
-		if len(octets) >= 4 {
-			octets[3] = fmt.Sprintf("%d", nextRandomIntn(256))
-			randomIP := strings.Join(octets, ".")
-			randomIPs = append(randomIPs, randomIP)
+		prefix = prefix.Masked()
+		bytes := prefix.Addr().As4()
+		bits := prefix.Bits()
+		for bit := bits; bit < 32; bit++ {
+			if nextRandomIntn(2) == 1 {
+				bytes[bit/8] |= 1 << uint(7-bit%8)
+			}
 		}
+		randomIPs = append(randomIPs, netip.AddrFrom4(bytes).String())
 	}
 	return randomIPs
 }
@@ -1716,7 +1807,7 @@ func randomIPv6InPrefix(prefix netip.Prefix) string {
 	return netip.AddrFrom16(ipBytes).String()
 }
 
-// 如果掩码 < 55，则从每个 /55 中随机提取一个 IPv6（每个 /48 共 128 个）
+// 如果掩码 < 55，则最多选取 128 个不同的 /55，每个子网随机取一个 IPv6（/48 恰好 128 个）
 // 如果掩码 >= 55，则从当前 CIDR 中随机提取一个 IPv6
 func getRandomIPv6s(ipList []string) []string {
 	var randomIPs []string
@@ -1741,9 +1832,14 @@ func getRandomIPv6s(ipList []string) []string {
 
 		if bits < 55 {
 			count := uint64(1) << uint(55-bits)
+			step := uint64(1)
+			if count > 128 {
+				step = count / 128
+				count = 128
+			}
 
 			for i := uint64(0); i < count; i++ {
-				p55 := makeSubPrefix(prefix, 55, i)
+				p55 := makeSubPrefix(prefix, 55, i*step)
 				randomIPs = append(randomIPs, randomIPv6InPrefix(p55))
 			}
 		} else {
@@ -1773,6 +1869,10 @@ func readIPs(filename string) ([]string, error) {
 			ipAddr, ipNet, err := net.ParseCIDR(line)
 			if err != nil {
 				return nil, err
+			}
+			ones, width := ipNet.Mask.Size()
+			if width-ones > 16 {
+				return nil, fmt.Errorf("网段 %s 含超过 65536 个 IP，无法完整展开；请使用 -random=true", line)
 			}
 			for currentIP := ipAddr.Mask(ipNet.Mask); ipNet.Contains(currentIP); incrementIP(currentIP) {
 				ips = append(ips, currentIP.String())
@@ -1823,35 +1923,22 @@ func generateTargets(ips []string, port int) []string {
 }
 
 func checkValidIP(ip string, port int, useTLS bool, domain string, code int) bool {
-	address := ip
-	if strings.Contains(ip, ":") {
-		address = fmt.Sprintf("[%s]", ip)
-	}
 	targetURL := fmt.Sprintf("http://%s", domain)
 	if useTLS {
 		targetURL = fmt.Sprintf("https://%s", domain)
 	}
 
-	cacheKey := fmt.Sprintf("%s:%d", address, port)
-	clientAny, loaded := validIPClientCache.Load(cacheKey)
-	var client *http.Client
-	if loaded {
-		client = clientAny.(*http.Client)
-	} else {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				dialer := &net.Dialer{Timeout: 2 * time.Second}
-				return dialer.DialContext(ctx, network, fmt.Sprintf("%s:%d", address, port))
-			},
-		}
-		newClient := &http.Client{
-			Timeout:   2 * time.Second,
-			Transport: transport,
-		}
-		actual, _ := validIPClientCache.LoadOrStore(cacheKey, newClient)
-		client = actual.(*http.Client)
+	// 每个探测独立创建 Transport，避免随机补充 IP 使客户端缓存无限增长。
+	transport := &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 2 * time.Second}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ip, fmt.Sprintf("%d", port)))
+		},
 	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: 2 * time.Second, Transport: transport}
 
 	resp, err := client.Get(targetURL)
 	if err != nil {
@@ -1890,6 +1977,7 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 	failCount := 0
 	wasUnhealthy := false
 	lastLoggedIP := ""
+	lastCheckedIP := ""
 	auditLogf("状态检查已启动：间隔=%d ms，失败阈值=2 次", interval.Milliseconds())
 
 	for {
@@ -1899,6 +1987,10 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 			return
 		case <-ticker.C:
 			currentIP := ipManager.GetCurrentIP()
+			if currentIP != lastCheckedIP {
+				failCount, wasUnhealthy = 0, false
+				lastCheckedIP = currentIP
+			}
 			if currentIP == "" {
 				failCount++
 				wasUnhealthy = true
@@ -1916,6 +2008,12 @@ func statusCheck(ctx context.Context, useTLS bool, port int, done chan bool, dom
 				failCount++
 				wasUnhealthy = true
 				auditLogf("状态检查失败 (%d/2)，当前 IP: %s", failCount, currentIP)
+			}
+
+			if ipManager.GetCurrentIP() != currentIP {
+				// 定时选路在检查期间已切换，不累计旧 IP 的失败次数。
+				failCount, wasUnhealthy = 0, false
+				continue
 			}
 
 			if failCount >= 2 {
@@ -2035,7 +2133,7 @@ func periodicRouteSelector(ctx context.Context, interval time.Duration, num int,
 			auditLogf("定时选路保持当前 IP %s：最佳候选 %s 改善 %d ms，未超过阈值 %d ms", currentIP, bestIP, (current.latency - best.latency).Milliseconds(), routeThreshold.Milliseconds())
 			return
 		}
-		changed, index, found := ipManager.SetCurrentIPByValue(bestIP)
+		changed, index, found := ipManager.SetCurrentIPIfUnchanged(currentIP, bestIP)
 		if found && changed {
 			auditLogf("定时选路更新转发 IP: %s -> %s，延迟 %d ms，索引 %d", currentIP, bestIP, best.latency.Milliseconds(), index)
 		}
@@ -2155,14 +2253,19 @@ func pipeConnections(src, dst net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(src, dst)
-		closeBoth()
+		if tcp, ok := src.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(dst, src)
-		closeBoth()
+		if tcp, ok := dst.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 	}()
 
 	wg.Wait()
+	closeBoth()
 }
