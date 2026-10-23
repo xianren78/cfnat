@@ -35,7 +35,51 @@ var (
 	randomMu          sync.Mutex
 	randomGenerator   = rand.New(rand.NewSource(time.Now().UnixNano()))
 	runtimeLogger     *RuntimeLogger
+	error1034Check    *error1034Validator // 启动前设置，运行期间只读
 )
+
+type error1034Validator struct {
+	url  string
+	port string
+}
+
+// 请求的 Host 和 TLS SNI 保持为 URL 域名，仅将 TCP 连接定向到待验证的 IP。
+func (v *error1034Validator) valid(ip string) bool {
+	if v == nil {
+		return true
+	}
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		Proxy:             nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(ip, v.port))
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(v.url)
+	if err != nil {
+		auditLogf("1034 验证失败，排除 IP %s: %v", ip, err)
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		auditLogf("1034 验证读取失败，排除 IP %s: %v", ip, err)
+		return false
+	}
+	if bytes.Contains(bytes.ToLower(body), []byte("error code: 1034")) {
+		auditLogf("IP %s 返回 error code: 1034，排除该 IP", ip)
+		return false
+	}
+	return true
+}
 
 // IPManager 用于安全管理 IP 地址状态
 type IPManager struct {
@@ -1183,12 +1227,28 @@ func main() {
 	cfTTL := flag.Int("cf-ttl", 1, "Cloudflare DNS TTL，1 表示自动")
 	logFile := flag.String("log-file", "cfnat.log", "日志文件路径，自动保留最近 24 小时；为空表示不写日志文件")
 	debugLog := flag.Bool("debug", false, "debug 模式：将全部 log 输出同时写入日志文件")
+	error1034Enabled := flag.Bool("error1034-enable", false, "启用指定 URL 的 Cloudflare error code: 1034 验证")
+	error1034URL := flag.String("error1034-url", "", "1034 验证 URL，例如 https://deed.cloudmeai.de5.net:2053/；连接到每个待测 IP")
 	daemonMode := flag.Bool("d", false, "后台运行模式；父进程启动后台子进程后退出")
 
 	flag.Parse()
 
 	if *ipCount <= 0 || *maxThreads <= 0 {
 		log.Fatal("ipnum 和 task 必须大于 0")
+	}
+	if *error1034Enabled {
+		parsed, err := url.Parse(strings.TrimSpace(*error1034URL))
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil {
+			log.Fatal("error1034-url 必须是有效的 http:// 或 https:// URL")
+		}
+		checkPort := parsed.Port()
+		if checkPort == "" {
+			checkPort = "80"
+			if parsed.Scheme == "https" {
+				checkPort = "443"
+			}
+		}
+		error1034Check = &error1034Validator{url: parsed.String(), port: checkPort}
 	}
 
 	if *daemonMode && os.Getenv("CFNAT_DAEMONIZED") != "1" {
@@ -1952,7 +2012,7 @@ func checkValidIP(ip string, port int, useTLS bool, domain string, code int) boo
 		return false
 	}
 
-	return true
+	return error1034Check.valid(ip)
 }
 
 func selectValidIP(ipManager *IPManager, useTLS bool, port int, domain string, code int) (string, int) {
