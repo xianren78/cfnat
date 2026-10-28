@@ -50,6 +50,7 @@ func (v *error1034Validator) valid(ip string) bool {
 	}
 	transport := &http.Transport{
 		DisableKeepAlives: true,
+		ForceAttemptHTTP2: true,
 		Proxy:             nil,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(ip, v.port))
@@ -69,6 +70,10 @@ func (v *error1034Validator) valid(ip string) bool {
 		return false
 	}
 	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		auditLogf("1034 验证未协商到 HTTP/2，排除 IP %s: 协议=%s", ip, resp.Proto)
+		return false
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		auditLogf("1034 验证读取失败，排除 IP %s: %v", ip, err)
@@ -1238,15 +1243,12 @@ func main() {
 	}
 	if *error1034Enabled {
 		parsed, err := url.Parse(strings.TrimSpace(*error1034URL))
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil {
-			log.Fatal("error1034-url 必须是有效的 http:// 或 https:// URL")
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+			log.Fatal("HTTP/2 1034 验证要求 error1034-url 为有效的 https:// URL")
 		}
 		checkPort := parsed.Port()
 		if checkPort == "" {
-			checkPort = "80"
-			if parsed.Scheme == "https" {
-				checkPort = "443"
-			}
+			checkPort = "443"
 		}
 		error1034Check = &error1034Validator{url: parsed.String(), port: checkPort}
 	}
@@ -1267,6 +1269,9 @@ func main() {
 	if logHandle != nil {
 		defer logHandle.Close()
 		auditLogf("日志文件已启用: %s，保留最近 24 小时，每 10 分钟清理，debug=%v，daemon=%v", *logFile, *debugLog, os.Getenv("CFNAT_DAEMONIZED") == "1")
+	}
+	if *error1034Enabled {
+		auditLogf("1034 HTTP/2 验证已启用：URL=%s", error1034Check.url)
 	}
 
 	ipManager := NewIPManager()
